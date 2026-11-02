@@ -1,0 +1,6 @@
+#!/bin/sh
+# 带 CDP 调试端口的 Chromium；用户数据放在工作目录，登录状态随数据卷保留。
+# 容器内以 root 运行必须 --no-sandbox，--test-type 隐藏对应的警告条
+exec chromium --no-sandbox --test-type --start-maximized --no-first-run --no-default-browser-check \
+    --remote-debugging-port=9222 --remote-allow-origins=* \
+    --user-data-dir=/workspace/.browser "$@"
