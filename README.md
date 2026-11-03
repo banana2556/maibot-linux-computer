@@ -16,7 +16,21 @@
 | `linux_poll` | 继续等待超时返回 `running` 的操作，不重复执行 |
 | `linux_cancel` | 终止运行中的操作及其子进程 |
 
-工具对 Planner 直接可见，不需要先 `tool_search`。
+工具按「第一轮就可能要用」分层：`linux_read_page`、`linux_shell`、`linux_poll` 一直可见；
+`linux_desktop`（参数约 5000 字，占全部工具的七成）和 `linux_cancel` 是 deferred，第一次要用时先 `tool_search`，两个会一起载入。
+工具说明里列了使用者会说的动词和同义词（截圖、點擊、安裝、搜尋、screenshot、click……），供 `tool_search` 检索。
+
+## 工具目录（`tool_catalog`）
+
+开启时（默认）插件接管 Planner 的 deferred tools，对所有插件和内置工具生效，主程序不用改：
+
+- 主程序每轮列出全部 deferred 工具描述的提示，换成系统提示词末尾的类别目录：只列类别（工具名第一个 `_` 前的部分）和工具名，不放参数。
+- `tool_search` 搜到一个工具时，同类别的插件工具一起载入；载入后整个会话保持，搜索记录滑出上下文也不会折回去。
+- tools 数组按首次出现的顺序只追加、不重排，系统提示词内容固定，不破坏提示词缓存。
+- `tool_search` 每次最多 5 个；没搜到时结果改为列出可搜的类别（例如用简体「截图」搜不到繁体描述时，模型会看到可以搜 `linux`）。
+
+限制：主程序自带的 deferred 工具（`web_fetch` 等）插件拿不到参数定义，不能整组带出，只能靠搜索各自载入；
+主程序用 OpenAI 格式发送工具，不支持 Anthropic 的 `tool_reference`，新载入的工具只能追加到 tools 末尾。
 
 看网页走浏览器：页面真实渲染、执行 JavaScript，并带着在这台电脑上登录过的状态（例如在 noVNC 里手动登录过的网站）。
 主程序的 `web_search` / `web_fetch` 可以关掉，对话模型自带联网时搜索交给模型本身。
@@ -90,6 +104,7 @@ advanced_sub_agent = true
 | `computer.max_tabs` | 麦麦打开的网页标签页上限，默认 5，0 为不限制 |
 | `computer.progress_reminder_seconds` | 连续操作多少秒没说话就提醒汇报进度，默认 60，0 为关闭 |
 | `computer.prefer_subagent` | 在 Planner 系统提示词末尾要求查资料（搜索、读网页、比对信息）尽量交给子代理，只有打开单个链接这种一步完成的事自己做；默认开启，主程序没开 `planner_subagent` 时不生效 |
+| `computer.tool_catalog` | 接管 Planner 的 deferred tools（类别目录、整组载入、会话内保持、顺序固定），默认开启；关闭后交回主程序原本的 `tool_search` |
 
 ## 看它在做什么 / 手动接管
 

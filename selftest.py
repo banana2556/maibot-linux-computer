@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from plugin import LinuxComputerPlugin, add_link_reminder, add_progress_reminder  # noqa: E402
+from plugin import LinuxComputerPlugin, add_link_reminder, add_progress_reminder, apply_tool_catalog  # noqa: E402
 
 NAME = "maibot-linux-computer-selftest"
 
@@ -79,9 +79,66 @@ def check_progress_reminder() -> None:
     assert add_progress_reminder([*items, *call("r", 4, "reply")], 60, now=late) is None
 
 
+def check_tool_catalog() -> None:
+    """工具目录：类别目录进系统提示词、整组载入、会话内保持、tools 顺序不变、没搜到时列出类别。"""
+
+    def item(kind: str, item_id: str, **fields: object) -> dict:
+        return {"item_type": kind, "meta": {"item_id": item_id, "logical_turn_id": "t" if "Function" in kind else None,
+                                            "timestamp": "2026-11-03T12:00:00"}, **fields}
+
+    def tool(name: str) -> dict:
+        return {"type": "function", "function": {"name": name, "description": name, "parameters": {}}}
+
+    def reminder(*names: str) -> dict:  # 主程序 build_deferred_tools_reminder 的格式
+        lines = "\n".join(f"{index}. {name}: {name} 的描述" for index, name in enumerate(names, 1))
+        return item("UserMessageItem", "z", parts=[{"type": "text", "text": "<system-reminder>\n以下工具当前未直接暴露给你，"
+                    f"但可以通过 tool_search 工具发现并在后续轮次中使用：\n{lines}\n\n如需其中某个工具…\n</system-reminder>"}])
+
+    def search(call_id: str, output: str) -> list:
+        return [item("FunctionCallItem", call_id, tool_call={"call_id": call_id, "func_name": "tool_search",
+                                                              "args": {"query": "x"}, "extra_content": None}),
+                item("FunctionCallOutputItem", f"{call_id}-out", call_id=call_id, output=output, success=True,
+                     tool_name="tool_search")]
+
+    system = item("SystemMessageItem", "s", parts=[{"type": "text", "text": "system"}])
+    loaded: dict = {}
+    pool: dict = {}
+    names = lambda tools: [definition["function"]["name"] for definition in tools]  # noqa: E731
+
+    items, tools = apply_tool_catalog([system, reminder("linux_desktop", "linux_cancel", "web_fetch")],
+                                      [tool("reply"), tool("tool_search"), tool("linux_shell")], loaded, pool, {})
+    catalog = items[0]["parts"][0]["text"]
+    assert [i["meta"]["item_id"] for i in items] == ["s"], items  # 主程序的 deferred 提示被拿掉
+    assert "- linux：linux_desktop、linux_cancel\n- web：web_fetch\n" in catalog and "描述" not in catalog, catalog
+    assert names(tools) == ["reply", "tool_search", "linux_shell"], tools
+    assert tools[1]["function"]["parameters"]["properties"]["limit"]["maximum"] == 5, tools[1]
+
+    # 搜到 linux_desktop：同类别的 linux_cancel 一起载入，追加在末尾
+    found = search("1", "已找到 1 个 deferred tools，它们会在后续轮次中加入可用工具列表：\n- linux_desktop（本次新发现）")
+    items, tools = apply_tool_catalog([system, *found, reminder("linux_cancel", "web_fetch")],
+                                      [tool("reply"), tool("tool_search"), tool("linux_shell"), tool("linux_desktop")],
+                                      loaded, pool, {"linux_cancel": tool("linux_cancel")})
+    assert names(tools) == ["reply", "tool_search", "linux_shell", "linux_desktop", "linux_cancel"], tools
+    assert items[0]["parts"][0]["text"] == catalog, "目录不能变"
+    assert items[2]["output"].startswith("已載入：linux_desktop\n同類別一起載入：linux_cancel\n"), items[2]
+
+    # 搜索记录滑出上下文、主程序把工具折回 deferred 并换了顺序：仍保持载入、顺序不变；没搜到时列出类别
+    missed = search("2", "未找到匹配的 deferred tools，请尝试更完整的工具名、前缀或其他关键词。")
+    items, tools = apply_tool_catalog([system, *missed, reminder("linux_desktop", "linux_cancel", "web_fetch")],
+                                      [tool("linux_shell"), tool("reply"), tool("tool_search")], loaded, pool, {})
+    assert names(tools) == ["reply", "tool_search", "linux_shell", "linux_desktop", "linux_cancel"], tools
+    assert items[2]["output"] == "沒有找到符合的工具。可以改用這些類別名稱搜尋：linux、web。", items[2]
+
+    # 工具下线（不在本轮工具里、也不在 deferred 池里）才移除
+    _, tools = apply_tool_catalog([system, reminder("linux_desktop", "linux_cancel", "web_fetch")],
+                                  [tool("reply"), tool("tool_search")], loaded, pool, {})
+    assert names(tools) == ["reply", "tool_search", "linux_desktop", "linux_cancel"], tools
+
+
 async def main() -> None:
     check_link_reminder()
     check_progress_reminder()
+    check_tool_catalog()
     plugin = LinuxComputerPlugin()
     plugin.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
                               "computer": {"container_name": NAME, "vnc_port": 0, "allowed_chats": ["owner"], "max_tabs": 2}})

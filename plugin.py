@@ -34,6 +34,21 @@ SUBAGENT_PREFERENCE = (
     "派出時可以在同一輪用一句話告訴對方你在查，拿到結論後再回覆。"
     "只有開啟聊天裡的單一連結這種一步就能完成的事，才自己直接做。"
 )
+# 主程序 deferred tools 提示（runtime.build_deferred_tools_reminder）的开头和每行「N. 名称: 描述」
+DEFERRED_REMINDER = "以下工具当前未直接暴露给你"
+DEFERRED_LINE = re.compile(r"^\d+\. ([^\s:]+)", re.M)
+# 主程序 tool_search 结果里命中的每行「- 名称（本次新发现）」
+SEARCH_HIT = re.compile(r"^- ([^\s（]+)", re.M)
+# ponytail: 整个替换主程序 tool_search 的说明和参数；主程序以后给它加参数时要跟着改
+TOOL_SEARCH_FUNCTION = {
+    "name": "tool_search",
+    "description": "載入 deferred tools：用系統提示詞工具目錄裡的類別名稱（例如 linux）、工具名或想做的事搜尋，"
+    "命中的工具連同同類別的其他工具一起載入，下一輪起整個對話都能直接呼叫。只負責載入，不執行工具。",
+    "parameters": {"type": "object", "properties": {
+        "query": {"type": "string", "description": "類別名稱、工具名，或想做的事的動詞關鍵字"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 5, "description": "最多回傳幾個，預設 5"},
+    }, "required": ["query"]},
+}
 
 
 def add_link_reminder(items: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
@@ -108,14 +123,87 @@ def add_progress_reminder(
     return [*items[:end + 1], reminder, *items[end + 1:]]
 
 
-def add_subagent_preference(items: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-    """在系统提示词末尾要求查资料尽量交给子代理；内容固定，不破坏提示词缓存。没有系统提示词时返回 None。"""
+def append_to_system(items: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
+    """在系统提示词末尾追加固定内容，每轮相同，不破坏提示词缓存；没有系统提示词时原样返回。"""
     index = next((index for index, item in enumerate(items) if item.get("item_type") == "SystemMessageItem"), None)
     if index is None:
-        return None
+        return items
     parts = items[index]["parts"]
-    system = {**items[index], "parts": [*parts[:-1], {**parts[-1], "text": parts[-1]["text"] + SUBAGENT_PREFERENCE}]}
+    system = {**items[index], "parts": [*parts[:-1], {**parts[-1], "text": parts[-1]["text"] + text}]}
     return [*items[:index], system, *items[index + 1:]]
+
+
+def tool_name(definition: Dict[str, Any]) -> str:
+    return str(definition.get("function", {}).get("name") or "")
+
+
+def namespace(name: str) -> str:
+    """工具名第一个 _ 之前的部分就是类别，例如 linux_desktop → linux。"""
+    return name.split("_", 1)[0]
+
+
+def apply_tool_catalog(
+    items: List[Dict[str, Any]], tools: List[Dict[str, Any]], loaded: Dict[str, Dict[str, Any]],
+    pool: Dict[str, None], schemas: Dict[str, Dict[str, Any]],
+) -> tuple:
+    """接管 Planner 的 deferred tools，返回新的 (items, tools)。
+
+    - 主程序每轮列出全部 deferred 工具描述的提示换成系统提示词里的类别目录，只列类别和名称，不放参数。
+    - 搜到的工具连同同类别的其他工具一起载入，整个会话保持载入；主程序在搜索记录滑出上下文后会把它折回去，这里补回。
+    - tools 数组按首次出现的顺序只追加，不重排；tool_search 没搜到时改为列出可搜的类别。
+
+    loaded：本会话已载入的工具（名称→定义，按载入顺序）；pool：本会话见过的 deferred 工具名。两者都原地更新、只追加。
+    schemas：插件工具的完整定义，用来整组载入；主程序自带的工具拿不到定义，只能靠搜索载入。
+    """
+    reminder = next((index for index, item in enumerate(items) if item.get("item_type") == "UserMessageItem"
+                     and any(DEFERRED_REMINDER in part.get("text", "") for part in item.get("parts", []))), None)
+    deferred = [] if reminder is None else DEFERRED_LINE.findall(
+        "\n".join(part.get("text", "") for part in items[reminder]["parts"]))
+    if reminder is not None:
+        items = [*items[:reminder], *items[reminder + 1:]]
+    current = {tool_name(definition): definition for definition in tools}
+    discovered = [name for name in current if name not in loaded and name in pool]
+    pool.update(dict.fromkeys(deferred))
+    for name in list(loaded):
+        if name in current:
+            loaded[name] = current[name]  # 原位换成最新定义
+        elif name not in deferred:
+            del loaded[name]  # 既不在本轮工具里、也不在 deferred 池里：已经下线
+    for name, definition in current.items():
+        loaded.setdefault(name, definition)
+    for name in discovered:
+        for other in deferred:
+            if namespace(other) == namespace(name) and other in schemas:
+                loaded.setdefault(other, schemas[other])
+
+    groups: Dict[str, List[str]] = {}
+    for name in pool:
+        groups.setdefault(namespace(name), []).append(name)
+    if groups:
+        items = append_to_system(items, "\n\n<deferred_tools>\n以下是 deferred tools 的類別目錄，只列名稱；"
+                                 "要用時先用 tool_search 載入，用類別名稱搜尋會一次載入整組，載入後整個對話都能用。\n"
+                                 + "\n".join(f"- {group}：{'、'.join(names)}" for group, names in groups.items())
+                                 + "\n</deferred_tools>")
+
+    def search_output(item: Dict[str, Any]) -> Dict[str, Any]:
+        output = str(item.get("output", ""))
+        if item.get("item_type") != "FunctionCallOutputItem" or item.get("tool_name") != "tool_search":
+            return item
+        if output.startswith("未找到匹配"):
+            text = f"沒有找到符合的工具。可以改用這些類別名稱搜尋：{'、'.join(groups)}。" if groups else "目前沒有可以載入的工具。"
+        elif output.startswith("已找到"):
+            hits = SEARCH_HIT.findall(output)
+            together = [name for name in loaded if name in pool and name not in hits
+                        and namespace(name) in {namespace(hit) for hit in hits}]
+            text = "已載入：" + "、".join(hits) + (f"\n同類別一起載入：{'、'.join(together)}" if together else "") \
+                + "\n下一輪起整個對話都能直接呼叫。"
+        else:
+            return item
+        return {**item, "output": text}
+
+    tools = [{**definition, "function": TOOL_SEARCH_FUNCTION} if name == "tool_search" else definition
+             for name, definition in loaded.items()]
+    return [search_output(item) for item in items], tools
 
 
 def _is_own_message(item: Dict[str, Any]) -> bool:
@@ -193,6 +281,9 @@ class ComputerSectionConfig(PluginConfigBase):
         default=60, description="连续操作电脑超过这么多秒、期间没在聊天里说过话时，提醒麦麦先说一下进展；0 为关闭")
     prefer_subagent: bool = Field(
         default=True, description="在 Planner 提示词里要求查资料时尽量交给子代理；主程序开启 planner_subagent 时才生效")
+    tool_catalog: bool = Field(
+        default=True, description="接管 Planner 的 deferred tools：系统提示词只放类别目录，搜到的工具整组载入并在会话内保持，"
+        "tools 顺序固定；对所有插件和内置工具生效")
     vnc_port: int = Field(default=6080, description="noVNC 映射到宿主机 127.0.0.1 的端口，0 为不映射；删除容器重建后生效")
     docker_command: str = Field(default="docker", description="docker 可执行程序")
 
@@ -215,6 +306,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
         self._ensure_lock = asyncio.Lock()
         self._operations: Dict[str, asyncio.Task] = {}
         self._warmup: Optional[asyncio.Task] = None
+        # session_id → (已载入的工具, 见过的 deferred 工具)，见 apply_tool_catalog
+        self._tool_sessions: Dict[str, tuple] = {}
 
     async def on_load(self) -> None:
         """启用时预先构建镜像并启动容器，首次构建需要几分钟。"""
@@ -235,7 +328,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
         "linux_shell",
         description="在你的 Linux 沙盒電腦（Debian 容器，root）裡執行 bash 指令，回傳 stdout/stderr/exit_code，"
         "工作目錄 /workspace。可用 apt-get、pip、curl 等安裝軟體，裝過的軟體會保留。"
-        "長時間指令逾時回傳 running，用 linux_poll 等待結果，不要重複執行。",
+        "長時間指令逾時回傳 running，用 linux_poll 等待結果，不要重複執行。"
+        "用於：執行指令、跑程式或腳本、安裝軟體、下載檔案、查看檔案、終端機（terminal, command, install, download）。",
         parameters={"type": "object", "properties": {"command": {"type": "string"}, "timeout": TIMEOUT_SCHEMA},
                     "required": ["command"], "additionalProperties": False},
         visibility="visible",
@@ -255,12 +349,13 @@ class LinuxComputerPlugin(MaiBotPlugin):
         "你開的分頁超過上限會自動關閉最早的，不用自己關)；shell(command)；wait(seconds)；"
         "wait_window(title,seconds)、wait_process(pid,seconds)；browser(method,target,params) 呼叫 Chromium CDP，method=targets 列出頁面；"
         "read(urls 或 target,seconds) 讀取網頁內文。"
-        "只看網頁內容用 linux_read_page，純命令列任務用 linux_shell。逾時回傳 running，用 linux_poll 查詢，不要重複輸入。",
+        "只看網頁內容用 linux_read_page，純命令列任務用 linux_shell。逾時回傳 running，用 linux_poll 查詢，不要重複輸入。"
+        "用於：看畫面、截圖、點擊、輸入文字、拖曳、開啟程式或網頁、登入網站、操作圖形介面（screenshot, click, type, GUI, desktop, browser）。",
         parameters={"type": "object", "properties": {
             "actions": {"type": "array", "items": {"oneOf": action_schemas()}, "minItems": 1},
             "timeout": TIMEOUT_SCHEMA,
         }, "required": ["actions"], "additionalProperties": False},
-        visibility="visible",
+        visibility="deferred",
         timeout_ms=TOOL_RPC_TIMEOUT_MS,
     )
     async def handle_desktop(
@@ -278,7 +373,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
         "搜尋時讀取 https://html.duckduckgo.com/html/?q=關鍵字（Google 會攔截自動存取），"
         "摘要不夠回答時，從 links 裡挑 2～3 個最相關的結果一次開啟；資訊足夠回答就停，不要為了更完整一直讀下去。"
         "需要搜尋加讀好幾頁的資料查詢，優先交給 subagent 並授權本工具，你繼續聊天。"
-        "每次在新分頁開啟、讀完關閉；需要看畫面、點擊或登入時改用 linux_desktop。",
+        "每次在新分頁開啟、讀完關閉；需要看畫面、點擊或登入時改用 linux_desktop。"
+        "用於：搜尋、查資料、上網、Google、看連結、讀網頁、開網址（search, browse, web, url）。",
         parameters={"type": "object", "properties": {"urls": URLS_SCHEMA, "timeout": TIMEOUT_SCHEMA},
                     "required": ["urls"], "additionalProperties": False},
         visibility="visible",
@@ -296,7 +392,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
 
     @Tool(
         "linux_poll",
-        description="繼續等待 linux_shell / linux_desktop / linux_read_page 回傳 running 的操作，不會重複執行。",
+        description="繼續等待 linux_shell / linux_desktop / linux_read_page 回傳 running 的操作，不會重複執行。"
+        "用於：等待、查看進度、拿結果（wait, status, progress, result）。",
         parameters={"type": "object", "properties": {"operation_id": {"type": "string"}, "timeout": TIMEOUT_SCHEMA},
                     "required": ["operation_id"], "additionalProperties": False},
         visibility="visible",
@@ -309,10 +406,11 @@ class LinuxComputerPlugin(MaiBotPlugin):
 
     @Tool(
         "linux_cancel",
-        description="終止仍在執行的 Linux 電腦操作（連同它啟動的指令），已完成的動作不會復原。",
+        description="終止仍在執行的 Linux 電腦操作（連同它啟動的指令），已完成的動作不會復原。"
+        "用於：停止、中止、取消、強制結束卡住的指令或操作（stop, kill, abort, cancel）。",
         parameters={"type": "object", "properties": {"operation_id": {"type": "string"}},
                     "required": ["operation_id"], "additionalProperties": False},
-        visibility="visible",
+        visibility="deferred",
         timeout_ms=TOOL_RPC_TIMEOUT_MS,
     )
     async def handle_cancel(self, operation_id: str, stream_id: str = "", **kwargs: Any) -> Dict[str, Any]:
@@ -323,20 +421,45 @@ class LinuxComputerPlugin(MaiBotPlugin):
     # ===== Hook =====
 
     @HookHandler("maisaka.planner.before_request",
-                 description="提醒 Planner 打开聊天里的链接、长时间操作电脑时先说一下进展，可要求查资料交给子代理")
+                 description="提醒 Planner 打开聊天里的链接、长时间操作电脑时先说一下进展，可要求查资料交给子代理，接管 deferred tools")
     async def handle_planner_request(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
         """提醒都插在对应内容之后，不放进请求末尾的工具提示里。
 
-        子代理的请求也经过这个 hook：它没有 reply 和 subagent 工具，所以不会收到进度提醒和子代理要求。
+        子代理的请求也经过这个 hook：它没有 reply、subagent 和 tool_search，所以不会收到进度提醒、子代理要求，
+        工具也不被接管。
         """
         original = kwargs.get("items") or []
-        tools = {definition.get("function", {}).get("name") for definition in kwargs.get("tool_definitions") or []}
+        definitions = kwargs.get("tool_definitions") or []
+        tools = {tool_name(definition) for definition in definitions}
         items = add_link_reminder(original) or original
         if "reply" in tools:
             items = add_progress_reminder(items, self.config.computer.progress_reminder_seconds) or items
         if self.config.computer.prefer_subagent and "subagent" in tools:
-            items = add_subagent_preference(items) or items
-        return None if items is original else {"action": "continue", "modified_kwargs": {**kwargs, "items": items}}
+            items = append_to_system(items, SUBAGENT_PREFERENCE)
+        result = definitions
+        if self.config.computer.tool_catalog and "tool_search" in tools:
+            loaded, pool = self._tool_sessions.setdefault(str(kwargs.get("session_id") or ""), ({}, {}))
+            discovering = any(name not in loaded and name in pool for name in tools)
+            items, result = apply_tool_catalog(items, definitions, loaded, pool,
+                                               await self._plugin_tool_schemas() if discovering else {})
+        if items is original and result is definitions:
+            return None
+        return {"action": "continue", "modified_kwargs": {**kwargs, "items": items, "tool_definitions": result}}
+
+    async def _plugin_tool_schemas(self) -> Dict[str, Dict[str, Any]]:
+        """所有插件工具的完整定义，用于整组载入；拿不到时只载入搜到的那个。"""
+        try:
+            tools = await self.ctx.tool.get_definitions()
+        except Exception as exc:  # 能力调用失败不影响本轮请求
+            self.ctx.logger.warning(f"读取插件工具定义失败，本次不整组载入：{exc}")
+            return {}
+        return {
+            tool["name"]: {"type": "function", "function": {
+                "name": tool["name"], "description": tool["definition"].get("description", ""),
+                "parameters": tool["definition"].get("parameters_schema")
+                or {"type": "object", "properties": {}, "required": []},
+            }} for tool in tools or [] if isinstance(tool, dict) and tool.get("name")
+        }
 
     # ===== 操作 =====
 
