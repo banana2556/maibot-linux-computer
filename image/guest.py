@@ -410,6 +410,8 @@ def run(op_id: str, request: dict) -> dict:
     except Cancelled as exc:
         result = {"success": False, "status": "cancelled", "error": str(exc)}
         desktop.release()
+    except KeyError as exc:  # 动作参数是扁平的，送出前不按动作校验，缺字段在这里说清楚
+        result = {"success": False, "status": "failed", "error": f"第 {len(outputs) + 1} 個動作缺少或填錯欄位：{exc}"}
     except Exception as exc:
         detail = f"\n{exc.stderr}" if isinstance(exc, subprocess.CalledProcessError) else ""
         result = {"success": False, "status": "failed", "error": f"{type(exc).__name__}: {exc}{detail}"}

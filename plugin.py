@@ -257,35 +257,32 @@ def _is_own_message(item: Dict[str, Any]) -> bool:
     return item.get("item_type") == "UserMessageItem" and bool(texts) and bool(SELF_HEADER.match(texts[0]))
 
 
-def action_schemas() -> List[Dict[str, Any]]:
-    number = {"type": "number", "minimum": 0}
-    seconds = {"type": "number", "minimum": 0}
-    text = {"type": "string"}
-    keys = {"type": "array", "items": text, "minItems": 1}
-    button = {"type": "string", "enum": ["left", "right", "middle"]}
-    definitions = [
-        ("observe", {}, []),
-        ("release", {}, []),
-        ("move", {"x": number, "y": number}, ["x", "y"]),
-        ("click", {"x": number, "y": number, "button": button}, ["x", "y"]),
-        ("double_click", {"x": number, "y": number, "button": button}, ["x", "y"]),
-        ("drag", {"x": number, "y": number, "end_x": number, "end_y": number,
-                  "seconds": seconds, "button": button}, ["x", "y", "end_x", "end_y"]),
-        ("mouse_down", {"button": button}, []), ("mouse_up", {"button": button}, []),
-        ("scroll", {"delta": {"type": "integer"}}, ["delta"]),
-        ("keys", {"keys": keys, "seconds": seconds}, ["keys"]),
-        ("key_down", {"keys": keys}, ["keys"]), ("key_up", {"keys": keys}, ["keys"]),
-        ("type", {"text": text}, ["text"]),
-        ("open", {"path": text, "arguments": {"type": "array", "items": text}}, ["path"]),
-        ("shell", {"command": text}, ["command"]),
-        ("wait", {"seconds": seconds}, ["seconds"]),
-        ("wait_window", {"title": text, "seconds": seconds}, ["title", "seconds"]),
-        ("wait_process", {"pid": {"type": "integer", "minimum": 1}, "seconds": seconds}, ["pid", "seconds"]),
-        ("browser", {"method": text, "target": text, "params": {"type": "object"}}, ["method"]),
-        ("read", {"urls": URLS_SCHEMA, "target": text, "seconds": seconds}, []),
-    ]
-    return [{"type": "object", "properties": {"action": {"type": "string", "const": name}, **fields},
-             "required": ["action", *required], "additionalProperties": False} for name, fields, required in definitions]
+# 桌面动作参数摊平成一个对象：每个动作要填哪些字段只在 action 的说明里写一次，缺字段时 guest.py 报出来
+DESKTOP_ACTION = {"type": "object", "properties": {
+    "action": {"type": "string", "enum": [
+        "observe", "move", "click", "double_click", "drag", "mouse_down", "mouse_up", "release", "scroll",
+        "keys", "key_down", "key_up", "type", "open", "shell", "wait", "wait_window", "wait_process", "browser", "read"],
+        "description": "observe：只截圖\n"
+        "move、click、double_click：x、y，可加 button\n"
+        "drag：從 x、y 拖到 end_x、end_y，可加 seconds、button\n"
+        "mouse_down、mouse_up：可加 button；release：放開所有按鍵和滑鼠\n"
+        "scroll：delta，正數向上\n"
+        "keys：keys，例如 [\"ctrl\", \"l\"]，可加 seconds 持續按住；key_down、key_up：keys\n"
+        "type：text\n"
+        "open：path 是程式或 http(s) 網址，可加 arguments；網址在新分頁開啟並回傳 target，分頁超過上限會自動關閉最早的\n"
+        "shell：command\n"
+        "wait：seconds；wait_window：title、seconds；wait_process：pid、seconds\n"
+        "browser：method 呼叫 Chromium CDP（targets 列出分頁），可加 target、params\n"
+        "read：target，讀已開啟分頁的內文"},
+    "x": {"type": "number"}, "y": {"type": "number"}, "end_x": {"type": "number"}, "end_y": {"type": "number"},
+    "button": {"type": "string", "enum": ["left", "right", "middle"]},
+    "delta": {"type": "integer"},
+    "keys": {"type": "array", "items": {"type": "string"}},
+    "seconds": {"type": "number", "minimum": 0},
+    "text": {"type": "string"}, "path": {"type": "string"}, "arguments": {"type": "array", "items": {"type": "string"}},
+    "command": {"type": "string"}, "title": {"type": "string"}, "pid": {"type": "integer"},
+    "method": {"type": "string"}, "target": {"type": "string"}, "params": {"type": "object"},
+}, "required": ["action"], "additionalProperties": False}
 
 
 URLS_SCHEMA = {"type": "array", "items": {"type": "string", "pattern": "^https?://"}, "minItems": 1, "maxItems": 5,
@@ -387,17 +384,11 @@ class LinuxComputerPlugin(MaiBotPlugin):
 
     @Tool(
         "linux_desktop",
-        description="在 Linux 沙盒電腦的圖形桌面上批次操作並回傳截圖。先 observe，座標依最新截圖。"
-        "動作：observe；move/click/double_click(x,y,button)；drag(x,y,end_x,end_y,seconds,button)；mouse_down/mouse_up(button)；"
-        "scroll(delta，正數向上)；keys/key_down/key_up(keys 陣列，如 ctrl、enter、a，keys 可加 seconds 持續按住)；type(text)；"
-        "open(path,arguments，程式或 http(s) 網址；網址在 Chromium 新分頁開啟並回傳 target，"
-        "你開的分頁超過上限會自動關閉最早的，不用自己關)；shell(command)；wait(seconds)；"
-        "wait_window(title,seconds)、wait_process(pid,seconds)；browser(method,target,params) 呼叫 Chromium CDP，method=targets 列出頁面；"
-        "read(urls 或 target,seconds) 讀取網頁內文。"
-        "只看網頁內容用 linux_read_page，純命令列任務用 linux_shell。逾時回傳 running，用 linux_poll 查詢，不要重複輸入。"
-        "用於：看畫面、截圖、點擊、輸入文字、拖曳、開啟程式或網頁、登入網站、操作圖形介面（screenshot, click, type, GUI, desktop, browser）。",
+        description="在 Linux 沙盒電腦的圖形桌面上依序執行 actions，最後回傳截圖。"
+        "需要看畫面、點擊、輸入、登入，或 linux_read_page 讀取失敗、被阻擋時用它；只讀網頁文字用 linux_read_page。"
+        "座標依最新截圖，不確定畫面時先 observe。逾時回傳 running，用 linux_poll 等待，不要重複操作。",
         parameters={"type": "object", "properties": {
-            "actions": {"type": "array", "items": {"oneOf": action_schemas()}, "minItems": 1},
+            "actions": {"type": "array", "items": DESKTOP_ACTION, "minItems": 1},
             "timeout": TIMEOUT_SCHEMA,
         }, "required": ["actions"], "additionalProperties": False},
         visibility="visible",
@@ -418,8 +409,7 @@ class LinuxComputerPlugin(MaiBotPlugin):
         "搜尋時讀取 https://html.duckduckgo.com/html/?q=關鍵字（Google 會攔截自動存取），"
         "摘要不夠回答時，從 links 裡挑 2～3 個最相關的結果一次開啟；資訊足夠回答就停，不要為了更完整一直讀下去。"
         "需要搜尋加讀好幾頁的資料查詢，優先交給 subagent 並授權本工具，你繼續聊天。"
-        "每次在新分頁開啟、讀完關閉；讀取失敗、被阻擋，或需要看畫面、點擊、登入時改用 linux_desktop。"
-        "用於：搜尋、查資料、上網、Google、看連結、讀網頁、開網址（search, browse, web, url）。",
+        "每次在新分頁開啟、讀完關閉；讀取失敗、被阻擋，或需要看畫面、點擊、登入時改用 linux_desktop。",
         parameters={"type": "object", "properties": {"urls": URLS_SCHEMA, "timeout": TIMEOUT_SCHEMA},
                     "required": ["urls"], "additionalProperties": False},
         visibility="visible",

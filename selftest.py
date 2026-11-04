@@ -224,6 +224,12 @@ async def main() -> None:
             [{"action": "browser", "method": "Runtime.evaluate", "target": target, "params": {"expression": "document.title"}}],
             stream_id="owner")
         assert json.loads(cdp["content"])["results"][0]["result"]["result"]["result"]["value"] == "Example Domain", cdp
+        # 参数是扁平的，缺字段在执行时报出是哪个动作、哪个字段
+        missing = await plugin.handle_desktop([{"action": "observe"}, {"action": "click", "y": 10}], stream_id="owner")
+        assert not missing["success"] and "第 2 個動作缺少或填錯欄位：'x'" in missing["error"], missing
+        # desktop 的 read 只读已打开的分页
+        opened = await plugin.handle_desktop([{"action": "read", "target": target}], stream_id="owner")
+        assert json.loads(opened["content"])["results"][0]["result"]["title"] == "Example Domain", opened
 
         async def tab_ids() -> list:
             listed = await plugin.handle_desktop([{"action": "browser", "method": "targets"}], stream_id="owner")

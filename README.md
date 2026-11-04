@@ -12,13 +12,13 @@
 |---|---|
 | `linux_shell` | 执行 bash（root），返回 stdout/stderr/exit_code，不截图 |
 | `linux_read_page` | 用 Chromium 打开网址（一次最多 5 个，并行读取），返回最终网址、标题、正文文字和页面上的链接，不截图；每个网址单独标签页、读完关闭，多个聊天同时读互不干扰 |
-| `linux_desktop` | 批量桌面动作（点击、输入、按键、拖拽、打开程序/网址、CDP 调用、`read` 读正文……），返回截图 |
+| `linux_desktop` | 批量桌面动作（点击、输入、按键、拖拽、打开程序/网址、CDP 调用、`read` 读已打开分页的正文……），返回截图 |
 | `linux_poll` | 继续等待超时返回 `running` 的操作，不重复执行 |
 | `linux_cancel` | 终止运行中的操作及其子进程 |
 
 麦麦是模拟真人聊天的 bot，看网页远比装软件常见，工具按这个分层：`linux_read_page`、`linux_desktop` 一直可见
-（`linux_desktop` 参数约 5000 字，每轮都会带上）；`linux_shell`、`linux_poll`、`linux_cancel` 是 deferred，第一次要用时先 `tool_search`，三个会一起载入。操作超时返回 running 时，插件直接把这一组载入，下一轮就能 `linux_poll`。
-工具说明里列了使用者会说的动词和同义词（截圖、點擊、安裝、搜尋、screenshot、click……），供 `tool_search` 检索。
+（两个合计约 2600 字，每轮都会带上）；`linux_shell`、`linux_poll`、`linux_cancel` 是 deferred，第一次要用时先 `tool_search`，三个会一起载入。操作超时返回 running 时，插件直接把这一组载入，下一轮就能 `linux_poll`。
+参照 Claude Code 的工具写法：`linux_desktop` 的参数摊平成一个 `action` 选项加选填字段，每个动作要填什么只在 `action` 的说明里写一次，缺字段时执行结果会指出是第几个动作、哪个字段；工具说明只写什么时候用、什么时候不用。只有 deferred 的三个工具在说明里列了使用者会说的动词和同义词（安裝、等待、停止、install、kill……），供 `tool_search` 检索。
 
 ## 工具目录（`tool_catalog`）
 
