@@ -289,31 +289,33 @@ async def main() -> None:
             return ""
 
         plugin._ask_model = broken_model
-        # 同一聊天 15 分钟内重读同一网址：不进容器，沿用原文重新摘取，并说明重读不会多出内容
+        fallback = await plugin.handle_read_page(["https://example.com/?fallback"], prompt="x", stream_id="owner")
+        fallback_page = json.loads(fallback["content"])["results"][0]["result"]["pages"][0]
+        assert fallback_page["answer_error"] and "domain" in fallback_page["text"], fallback_page
+        plugin._ask_model = fake_model
+        # 同一聊天 15 分钟内同一网址只能读一次：换个问法重读直接拒绝，不进容器，导向 linux_desktop
         guest_calls = []
         real_guest = plugin._guest
         plugin._guest = lambda *args: (guest_calls.append(args), real_guest(*args))[1]
-        fallback = await plugin.handle_read_page(["https://example.com"], prompt="x", stream_id="owner")
+        again = await plugin.handle_read_page(["https://example.com"], prompt="換個問法", stream_id="owner")
         plugin._guest = real_guest
-        fallback_page = json.loads(fallback["content"])["results"][0]["result"]["pages"][0]
-        assert fallback_page["answer_error"] and "domain" in fallback_page["text"], fallback_page
-        assert "不會多出內容" in fallback_page["reread"] and not guest_calls, (fallback_page, guest_calls)
-        plugin._ask_model = fake_model
+        assert not again["success"] and "linux_desktop" in again["error"] and not guest_calls, (again, guest_calls)
         # 超过 EXTRACT_TEXT_LIMIT 的原文截断，结果里标出还有多少没读到
         long = await plugin.handle_read_page(["http://127.0.0.1:8765/long.html"], prompt="x", stream_id="owner")
         long_page = json.loads(long["content"])["results"][0]["result"]["pages"][0]
         assert "沒有讀到" in long_page["truncated"] and "後面還有" in asked[-1], long_page
-        # 一次并行读多个：打不开的只在自己那一项报错
-        mixed = await plugin.handle_read_page(["https://example.com", "https://nonexistent.invalid"], prompt="x",
-                                              stream_id="owner")
-        pages = json.loads(mixed["content"])["results"][0]["result"]["pages"]
+        # 一次并行读多个：打不开的只在自己那一项报错；读过的网址跳过并说明
+        mixed = await plugin.handle_read_page(["https://example.com", "https://example.com/?mixed",
+                                               "https://nonexistent.invalid"], prompt="x", stream_id="owner")
+        result = json.loads(mixed["content"])["results"][0]["result"]
+        pages = result["pages"]
         assert mixed["success"] and pages[0]["answer"] == "摘要" and "開啟失敗" in pages[1]["error"], pages
-        assert "reread" in pages[0] and "reread" not in pages[1], pages  # 读过的照样标出，整批重新读取
+        assert len(pages) == 2 and result["skipped"].startswith("https://example.com 剛才"), result
         bad = await plugin.handle_read_page(["https://nonexistent.invalid"], prompt="x", stream_id="owner")
         assert not bad["success"] and "開啟失敗" in bad["error"] and "linux_desktop" in bad["error"], bad
         # 被拦截或 HTTP 错误：标出原因，附上改用桌面的提示；正常页面不标
         blocked = await plugin.handle_read_page(["http://127.0.0.1:8765/block.html", "http://127.0.0.1:8765/missing",
-                                                 "https://example.com"], prompt="x", stream_id="owner")
+                                                 "https://example.com/?blocked"], prompt="x", stream_id="owner")
         result = json.loads(blocked["content"])["results"][0]["result"]
         assert [page.get("problem") for page in result["pages"]] == ["像是驗證或阻擋頁面", "HTTP 404", None], result
         assert "linux_desktop" in result["hint"], result
