@@ -12,6 +12,7 @@ from uuid import uuid4
 import asyncio
 import json
 import re
+import time
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 
@@ -31,8 +32,8 @@ SELF_HEADER = re.compile(r'<message [^>]*is_self_message="true"')
 RECENT_IM_MESSAGES = 10
 SUBAGENT_PREFERENCE = (
     "\n\n查資料（搜尋、讀網頁、比對資訊）時，盡量交給 subagent 去做，並授權它需要的工具；"
-    "派出時可以在同一輪用一句話告訴對方你在查，拿到結論後再回覆。"
-    "只有開啟聊天裡的單一連結這種一步就能完成的事，才自己直接做。"
+    "派出時可以在同一輪用一句話告訴對方你在查，之後等它回報，不要自己再查同一件事。"
+    "只有開啟聊天裡的單一連結這種一步就能完成的事，才自己直接做；讀過一次就依結果回覆，不要換個問法重讀同一個網址。"
 )
 # 主程序 deferred tools 提示（runtime.build_deferred_tools_reminder）的开头和每行「N. 名称: 描述」
 DEFERRED_REMINDER = "以下工具当前未直接暴露给你"
@@ -317,7 +318,10 @@ URLS_SCHEMA = {"type": "array", "items": {"type": "string", "pattern": "^https?:
 TIMEOUT_SCHEMA = {"type": "number", "minimum": 0, "maximum": MAX_WAIT_SECONDS,
                   "description": f"最多等待秒數，預設 60，上限 {MAX_WAIT_SECONDS}；逾時回傳 running 和 operation_id"}
 # linux_read_page 像 Claude Code 的 WebFetch：原文交给小模型按 prompt 摘取，只有摘要进 Planner 上下文
-EXTRACT_TEXT_LIMIT = 15000  # 每页交给小模型的正文上限
+EXTRACT_TEXT_LIMIT = 100000  # 每页交给小模型的正文上限，同 WebFetch
+# 同 WebFetch 的 15 分钟缓存：同一聊天重读同一网址不再开浏览器，只按新 prompt 重新摘取，并告诉模型内容不会变
+PAGE_CACHE_SECONDS = 900
+REREAD_NOTE = "剛才讀過這頁，同一網址重讀不會多出內容；資訊不夠就照已知的回答，要最新內容用 linux_desktop 的 open 加 read。"
 EXTRACT_LINKS = 40
 EXTRACT_TIMEOUT_MS = 120000
 PAGE_TEXT_FALLBACK = 3000  # 摘取失败时退回的原文字数
@@ -397,6 +401,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
         self._ready = False
         self._ensure_lock = asyncio.Lock()
         self._operations: Dict[str, asyncio.Task] = {}
+        # (stream_id, url) → (读取时间, 页面)，见 PAGE_CACHE_SECONDS
+        self._pages: Dict[tuple, tuple] = {}
         self._warmup: Optional[asyncio.Task] = None
         # session_id → (已载入的工具, 见过的 deferred 工具)，见 apply_tool_catalog
         self._tool_sessions: Dict[str, tuple] = {}
@@ -480,20 +486,36 @@ class LinuxComputerPlugin(MaiBotPlugin):
             return {"success": False, "error": "需要至少一個網址（urls）。"}
         if not prompt.strip():
             return {"success": False, "error": "需要 prompt：寫想從這些網頁知道什麼。要完整原文請用 linux_desktop 的 open 加 read。"}
-        action = {"action": "read", "urls": urls[:5], "text_limit": EXTRACT_TEXT_LIMIT, "link_limit": EXTRACT_LINKS}
-        return await self._safe(self._submit([action], timeout, stream_id, screenshot=False,
-                                             post=lambda result: self._extract(result, prompt)))
+        urls = urls[:5]
+        now = time.monotonic()
+        self._pages = {key: hit for key, hit in self._pages.items() if now - hit[0] < PAGE_CACHE_SECONDS}
+        seen = {url for url in urls if (stream_id, url) in self._pages}
+        # 全部读过才不进容器；有一个没读过就整批重读，失败时的结果和没有快取时一样
+        cached = {url: self._pages[(stream_id, url)][1] for url in seen} if len(seen) == len(set(urls)) else {}
+        actions = [] if cached else [
+            {"action": "read", "urls": urls, "text_limit": EXTRACT_TEXT_LIMIT, "link_limit": EXTRACT_LINKS}]
+        return await self._safe(self._submit(actions, timeout, stream_id, screenshot=False,
+                                             post=lambda result: self._extract(result, prompt, urls, cached, seen, stream_id)))
 
-    async def _extract(self, result: Dict[str, Any], prompt: str) -> Dict[str, Any]:
-        """每页原文分别交给小模型按 prompt 摘取，读取失败或被拦截的页面原样保留原因。"""
+    async def _extract(self, result: Dict[str, Any], prompt: str, urls: List[str], cached: Dict[str, Any],
+                       seen: set, stream_id: str) -> Dict[str, Any]:
+        """读到的页面并入快取；每页原文分别交给小模型按 prompt 摘取，读取失败或被拦截的页面原样保留原因。"""
         if not result.get("success"):
             return result
-        step = result["results"][0]
-        pages = await asyncio.gather(*(self._extract_page(page, prompt) for page in step["result"]["pages"]))
+        step = result["results"][0] if result["results"] else {"action": "read", "result": {}}
+        fetched = iter(step["result"].get("pages", []))
+        pages = []
+        for url in urls:
+            page = cached[url] if cached else next(fetched)
+            if not cached and "error" not in page and "problem" not in page:
+                self._pages[(stream_id, url)] = (time.monotonic(), page)
+            pages.append({**page, "reread": REREAD_NOTE} if url in seen else page)
+        pages = await asyncio.gather(*(self._extract_page(page, prompt) for page in pages))
         return {**result, "results": [{**step, "result": {**step["result"], "pages": list(pages)}}]}
 
     async def _extract_page(self, page: Dict[str, Any], prompt: str) -> Dict[str, Any]:
-        brief = {key: page[key] for key in ("url", "title", "note", "error", "problem") if key in page}
+        brief = {key: page[key] for key in ("url", "title", "note", "truncated", "reread", "error", "problem")
+                 if key in page}
         if "error" in page or "problem" in page:
             return brief
         links = "\n".join(f"- {link['text']}：{link['url']}" for link in page.get("links", [])) or "（沒有）"
@@ -633,7 +655,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
                    "max_tabs": self.config.computer.max_tabs}
 
         async def work() -> Dict[str, Any]:
-            result = await self._guest("run", operation_id, request)
+            # 没有动作时（例如网页全在快取里）不进容器
+            result = await self._guest("run", operation_id, request) if actions else {"success": True, "results": []}
             return await post(result) if post else result
 
         self._operations[operation_id] = asyncio.create_task(work())

@@ -37,9 +37,12 @@
 
 参照 Claude Code 的 WebFetch / 浏览器工具分工：
 
-- `linux_read_page`：只想知道网页里的某件事。每页原文（最多 1.5 万字）和链接交给 `extract_task` 指定的模型（默认 `utils`），
+- `linux_read_page`：只想知道网页里的某件事。每页原文（最多 10 万字，同 WebFetch）和链接交给 `extract_task` 指定的模型（默认 `utils`），
   按 `prompt` 摘出相关内容、列出要继续看的链接，只有摘要进 Planner 上下文。摘取失败时退回原文前 3000 字。
   每页多一次小模型调用，会慢几秒；超时返回 running 时，`linux_poll` 拿到的也是摘好的结果。
+  原文超过上限时结果标出 `truncated`（后面还有多少字没读到）。
+- 同一聊天 15 分钟内重读同一网址（同 WebFetch 的缓存）：整批网址都读过时不再开浏览器，沿用上次的原文按新 `prompt` 重新摘取；
+  读过的页面结果带 `reread`，说明重读不会多出内容、资讯不够就照已知的回答。避免 Planner 换个问法反复读同一页。
 - `linux_desktop` 的 `read`：要完整原文时用，例如 `[open 网址, read]`；不填 target 就读当前显示的分页。
 - 截图是 `observe` 动作，批次里有它才截，只读文字的批次不附图。
 - `elements` 列出当前分页里可以点的链接、按钮、输入框和坐标（和截图同比例，可直接 `click`），
@@ -122,7 +125,7 @@ advanced_sub_agent = true
 | `computer.progress_reminder_seconds` | 连续操作多少秒没说话就提醒汇报进度，默认 60，0 为关闭 |
 | `computer.desktop_reply_screenshot` | 上次说话后在桌面上操作过时，要求回复附上最新截图，默认开启 |
 | `computer.extract_task` | `linux_read_page` 按 `prompt` 摘取网页用的模型任务（`model_config` 里的任务名），默认 `utils`，建议用快的小模型 |
-| `computer.prefer_subagent` | 在 Planner 系统提示词末尾要求查资料（搜索、读网页、比对信息）尽量交给子代理，只有打开单个链接这种一步完成的事自己做；默认开启，主程序没开 `planner_subagent` 时不生效 |
+| `computer.prefer_subagent` | 在 Planner 系统提示词末尾要求查资料（搜索、读网页、比对信息）尽量交给子代理，派出后等它回报、不自己重做；只有打开单个链接这种一步完成的事自己做，读过一次就回复，不换问法重读；默认开启，主程序没开 `planner_subagent` 时不生效 |
 | `computer.tool_catalog` | 接管 Planner 的 deferred tools（类别目录、整组载入、会话内保持、顺序固定），默认开启；关闭后交回主程序原本的 `tool_search` |
 
 ## 看它在做什么 / 手动接管

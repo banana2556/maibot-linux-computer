@@ -418,6 +418,7 @@ def read_page(url: str, target: str, seconds: float, text_limit: int = PAGE_TEXT
     if problem:
         result["problem"] = problem
     if len(result["text"]) > text_limit:
+        result["truncated"] = f"原文太長，後面 {len(result['text']) - text_limit} 字沒有讀到"
         result["text"] = result["text"][:text_limit] + f"\n...[後面還有 {len(result['text']) - text_limit} 字元未顯示]"
     return result
 
