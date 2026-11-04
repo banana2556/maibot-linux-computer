@@ -107,10 +107,8 @@ def add_progress_reminder(
     started = datetime.fromisoformat(calls[0]["meta"]["timestamp"])
     if ((now or datetime.now(started.tzinfo)) - started).total_seconds() < seconds:
         return None
-    end = max(index for index, item in enumerate(items) if item.get("item_type") == "FunctionCallOutputItem")
-    while end + 1 < len(items) and items[end + 1].get("item_type") == "UserMessageItem" \
-            and any(part.get("type") == "image" for part in items[end + 1].get("parts", [])):
-        end += 1
+    end = _after_tool_results(items, max(
+        index for index, item in enumerate(items) if item.get("item_type") == "FunctionCallOutputItem"))
     reminder = {
         "item_type": "UserMessageItem",
         "meta": {"item_id": f"progress-reminder-{items[end]['meta']['item_id']}", "logical_turn_id": None,
@@ -206,6 +204,47 @@ def apply_tool_catalog(
     return [search_output(item) for item in items], tools
 
 
+def add_screenshot_reminder(items: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """麦麦上次说话后用过 linux_desktop 时，要求回复附上最新截图；没有带截图的桌面操作时返回 None。
+
+    提醒插在最近一次带截图的 linux_desktop 那批工具结果（及其截图）之后，给出 reply 的 attach_pic 要填的 media_index。
+    """
+    spoke = max((index for index, item in enumerate(items) if _is_own_message(item)), default=-1)
+    calls = {item["tool_call"]["call_id"] for item in items[spoke + 1:] if item.get("item_type") == "FunctionCallItem"
+             and item["tool_call"]["func_name"] == "linux_desktop"}
+    # 主程序把工具返回的图片拆成媒体消息，并在结果文字里附 <tool_result_media_list>；截图是第 1 个媒体
+    shots = [index for index, item in enumerate(items) if item.get("item_type") == "FunctionCallOutputItem"
+             and item.get("call_id") in calls and "<tool_result_media_list>" in str(item.get("output", ""))]
+    if not shots:
+        return None
+    call_id = items[shots[-1]]["call_id"]
+    end = _after_tool_results(items, shots[-1])
+    reminder = {
+        "item_type": "UserMessageItem",
+        "meta": {"item_id": f"screenshot-reminder-{items[end]['meta']['item_id']}", "logical_turn_id": None,
+                 "timestamp": items[end]["meta"]["timestamp"]},
+        "parts": [{"type": "text", "text": "<system-reminder>\n你這段時間在桌面上操作過。回覆對方時一定要附上最新的截圖："
+                   f"reply 的 attach_pic 填 media_index=tool_result:{call_id}:1，讓對方看到實際畫面。\n</system-reminder>"}],
+    }
+    return [*items[:end + 1], reminder, *items[end + 1:]]
+
+
+def _after_tool_results(items: List[Dict[str, Any]], index: int) -> int:
+    """跳过紧跟在后面的同批工具结果和拆出来的工具媒体消息：提醒不能插进一批工具结果中间。
+
+    主程序先写完一轮所有工具结果，再追加以 <tool_result_media …/> 开头的媒体消息（视觉模式下带图片）。
+    """
+    def is_media(item: Dict[str, Any]) -> bool:
+        parts = item.get("parts", [])
+        return item.get("item_type") == "UserMessageItem" and bool(parts) and (
+            str(parts[0].get("text", "")).startswith("<tool_result_media") or any(p.get("type") == "image" for p in parts))
+
+    while index + 1 < len(items) and (items[index + 1].get("item_type") == "FunctionCallOutputItem"
+                                      or is_media(items[index + 1])):
+        index += 1
+    return index
+
+
 def _is_own_message(item: Dict[str, Any]) -> bool:
     """麦麦在聊天里说过的话：reply 调用，或历史里带 is_self_message 的消息。"""
     if item.get("item_type") == "FunctionCallItem":
@@ -279,6 +318,8 @@ class ComputerSectionConfig(PluginConfigBase):
     max_tabs: int = Field(default=5, description="麦麦用 open 打开的网页标签页最多保留几个，超出时自动关闭最早的；0 为不限制")
     progress_reminder_seconds: int = Field(
         default=60, description="连续操作电脑超过这么多秒、期间没在聊天里说过话时，提醒麦麦先说一下进展；0 为关闭")
+    desktop_reply_screenshot: bool = Field(
+        default=True, description="上次说话后用过 linux_desktop 时，要求麦麦回复时附上最新的截图")
     prefer_subagent: bool = Field(
         default=True, description="在 Planner 提示词里要求查资料时尽量交给子代理；主程序开启 planner_subagent 时才生效")
     tool_catalog: bool = Field(
@@ -434,6 +475,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
         items = add_link_reminder(original) or original
         if "reply" in tools:
             items = add_progress_reminder(items, self.config.computer.progress_reminder_seconds) or items
+            if self.config.computer.desktop_reply_screenshot:
+                items = add_screenshot_reminder(items) or items
         if self.config.computer.prefer_subagent and "subagent" in tools:
             items = append_to_system(items, SUBAGENT_PREFERENCE)
         result = definitions

@@ -12,7 +12,8 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from plugin import LinuxComputerPlugin, add_link_reminder, add_progress_reminder, apply_tool_catalog  # noqa: E402
+from plugin import (LinuxComputerPlugin, add_link_reminder, add_progress_reminder, add_screenshot_reminder,  # noqa: E402
+                    apply_tool_catalog)
 
 NAME = "maibot-linux-computer-selftest"
 
@@ -79,6 +80,38 @@ def check_progress_reminder() -> None:
     assert add_progress_reminder([*items, *call("r", 4, "reply")], 60, now=late) is None
 
 
+def check_screenshot_reminder() -> None:
+    """截图提醒：上次说话后用过 linux_desktop 才提醒，指向最近一次带截图的结果，插在它的截图之后。"""
+
+    def item(kind: str, item_id: str, **fields: object) -> dict:
+        return {"item_type": kind, "meta": {"item_id": item_id, "logical_turn_id": "t" if "Function" in kind else None,
+                                            "timestamp": "2026-11-04T12:00:00"}, **fields}
+
+    def call(item_id: str, name: str, output: str = "ok") -> list:
+        return [item("FunctionCallItem", item_id, tool_call={"call_id": item_id, "func_name": name, "args": {},
+                                                             "extra_content": None}),
+                item("FunctionCallOutputItem", f"{item_id}-out", call_id=item_id, output=output, success=True, tool_name=name)]
+
+    def desktop(item_id: str) -> list:  # 主程序拆出截图时的结果文字和媒体消息
+        media = f'ok\n\n<tool_result_media_list>\n  <media msg_id="tool_result:{item_id}:1" type="image" />\n</tool_result_media_list>'
+        return [*call(item_id, "linux_desktop", media),
+                item("UserMessageItem", f"{item_id}-shot", parts=[{"type": "image", "image_format": "jpeg", "image_base64": ""}])]
+
+    said = item("UserMessageItem", "self", parts=[{"type": "text", "text":
+                '<message msg_id="1" time="12:00:00" user="麦麦" is_self_message="true">\n好，我去弄'}])
+    items = [said, *desktop("a"), *desktop("b"), *call("c", "linux_desktop"), *call("d", "linux_shell")]
+    result = add_screenshot_reminder(items)
+    ids = [i["meta"]["item_id"] for i in result]
+    assert ids[ids.index("b-shot") + 1] == "screenshot-reminder-b-shot", ids  # c 没有截图，指向 b
+    assert "media_index=tool_result:b:1" in result[ids.index("b-shot") + 1]["parts"][0]["text"], result
+    # 同一轮并行调用：先是两个结果，再是截图；提醒要放在整批之后
+    shot_b, shell_d = desktop("b"), call("d", "linux_shell")
+    batch = [said, shot_b[0], shell_d[0], shot_b[1], shell_d[1], shot_b[2]]
+    assert [i["meta"]["item_id"] for i in add_screenshot_reminder(batch)][-2:] == ["b-shot", "screenshot-reminder-b-shot"]
+    assert add_screenshot_reminder([*items, *call("r", "reply")]) is None
+    assert add_screenshot_reminder([*desktop("a"), said, *call("d", "linux_shell")]) is None
+
+
 def check_tool_catalog() -> None:
     """工具目录：类别目录进系统提示词、整组载入、会话内保持、tools 顺序不变、没搜到时列出类别。"""
 
@@ -138,6 +171,7 @@ def check_tool_catalog() -> None:
 async def main() -> None:
     check_link_reminder()
     check_progress_reminder()
+    check_screenshot_reminder()
     check_tool_catalog()
     plugin = LinuxComputerPlugin()
     plugin.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},

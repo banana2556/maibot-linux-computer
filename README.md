@@ -62,6 +62,9 @@
 并且和下一步操作放在同一轮一起发出，不单独占一轮。
 说话后重新计时，所以长任务里大约每分钟会汇报一次；设为 0 关闭。
 
+麦麦上次说话后用过 `linux_desktop` 时（`desktop_reply_screenshot`，默认开启），同一个 hook 在那批工具结果和截图之后插入提醒：
+回复时一定要附上最新截图，并直接给出 `reply` 的 `attach_pic` 要填的 `media_index=tool_result:<call_id>:1`。
+
 只对 Planner 自己操作有效。后台子代理不能在聊天里说话，它工作时可以问麦麦「进度如何」，
 麦麦能随时截一张当前画面（桌面是共用的，看得到子代理正在做什么）；想实时看就用下面的 noVNC。
 
@@ -103,6 +106,7 @@ advanced_sub_agent = true
 | `computer.screenshot_max_edge` | 截图最长边，越小越省 token |
 | `computer.max_tabs` | 麦麦打开的网页标签页上限，默认 5，0 为不限制 |
 | `computer.progress_reminder_seconds` | 连续操作多少秒没说话就提醒汇报进度，默认 60，0 为关闭 |
+| `computer.desktop_reply_screenshot` | 上次说话后用过 `linux_desktop` 时，要求回复附上最新截图，默认开启 |
 | `computer.prefer_subagent` | 在 Planner 系统提示词末尾要求查资料（搜索、读网页、比对信息）尽量交给子代理，只有打开单个链接这种一步完成的事自己做；默认开启，主程序没开 `planner_subagent` 时不生效 |
 | `computer.tool_catalog` | 接管 Planner 的 deferred tools（类别目录、整组载入、会话内保持、顺序固定），默认开启；关闭后交回主程序原本的 `tool_search` |
 
