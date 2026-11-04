@@ -81,35 +81,44 @@ def check_progress_reminder() -> None:
 
 
 def check_screenshot_reminder() -> None:
-    """截图提醒：上次说话后用过 linux_desktop 才提醒，指向最近一次带截图的结果，插在它的截图之后。"""
+    """截图提醒：上次说话后在桌面上操作过才提醒；有截图就指向最近那张，没有就要求先 observe。"""
 
     def item(kind: str, item_id: str, **fields: object) -> dict:
         return {"item_type": kind, "meta": {"item_id": item_id, "logical_turn_id": "t" if "Function" in kind else None,
                                             "timestamp": "2026-11-04T12:00:00"}, **fields}
 
-    def call(item_id: str, name: str, output: str = "ok") -> list:
-        return [item("FunctionCallItem", item_id, tool_call={"call_id": item_id, "func_name": name, "args": {},
+    def call(item_id: str, name: str, output: str = "ok", *actions: str) -> list:
+        args = {"actions": [{"action": action} for action in actions]} if actions else {}
+        return [item("FunctionCallItem", item_id, tool_call={"call_id": item_id, "func_name": name, "args": args,
                                                              "extra_content": None}),
                 item("FunctionCallOutputItem", f"{item_id}-out", call_id=item_id, output=output, success=True, tool_name=name)]
 
-    def desktop(item_id: str) -> list:  # 主程序拆出截图时的结果文字和媒体消息
+    def desktop(item_id: str) -> list:  # click 加 observe；主程序拆出截图时的结果文字和媒体消息
         media = f'ok\n\n<tool_result_media_list>\n  <media msg_id="tool_result:{item_id}:1" type="image" />\n</tool_result_media_list>'
-        return [*call(item_id, "linux_desktop", media),
+        return [*call(item_id, "linux_desktop", media, "click", "observe"),
                 item("UserMessageItem", f"{item_id}-shot", parts=[{"type": "image", "image_format": "jpeg", "image_base64": ""}])]
+
+    def text(result: list, after: str) -> str:
+        ids = [i["meta"]["item_id"] for i in result]
+        assert ids[ids.index(after) + 1].startswith("screenshot-reminder-"), ids
+        return result[ids.index(after) + 1]["parts"][0]["text"]
 
     said = item("UserMessageItem", "self", parts=[{"type": "text", "text":
                 '<message msg_id="1" time="12:00:00" user="麦麦" is_self_message="true">\n好，我去弄'}])
-    items = [said, *desktop("a"), *desktop("b"), *call("c", "linux_desktop"), *call("d", "linux_shell")]
-    result = add_screenshot_reminder(items)
-    ids = [i["meta"]["item_id"] for i in result]
-    assert ids[ids.index("b-shot") + 1] == "screenshot-reminder-b-shot", ids  # c 没有截图，指向 b
-    assert "media_index=tool_result:b:1" in result[ids.index("b-shot") + 1]["parts"][0]["text"], result
+    # c 只读网页不算操作；截图指向最近一次操作后的 b，提醒放在最后一次桌面结果 c 之后
+    items = [said, *desktop("a"), *desktop("b"), *call("c", "linux_desktop", "ok", "open", "read"), *call("d", "linux_shell")]
+    assert "media_index=tool_result:b:1" in text(add_screenshot_reminder(items), "c-out")
+    # 点击后还没截图：要求先 observe
+    clicked = [said, *call("e", "linux_desktop", "ok", "click")]
+    assert "observe" in text(add_screenshot_reminder(clicked), "e-out")
+    # 只读网页、说话之后没操作、操作在说话之前：都不提醒
+    assert add_screenshot_reminder([said, *call("c", "linux_desktop", "ok", "open", "read", "elements")]) is None
+    assert add_screenshot_reminder([*items, *call("r", "reply")]) is None
+    assert add_screenshot_reminder([*desktop("a"), said, *call("d", "linux_shell")]) is None
     # 同一轮并行调用：先是两个结果，再是截图；提醒要放在整批之后
     shot_b, shell_d = desktop("b"), call("d", "linux_shell")
     batch = [said, shot_b[0], shell_d[0], shot_b[1], shell_d[1], shot_b[2]]
     assert [i["meta"]["item_id"] for i in add_screenshot_reminder(batch)][-2:] == ["b-shot", "screenshot-reminder-b-shot"]
-    assert add_screenshot_reminder([*items, *call("r", "reply")]) is None
-    assert add_screenshot_reminder([*desktop("a"), said, *call("d", "linux_shell")]) is None
 
 
 async def check_tool_catalog() -> None:
@@ -227,9 +236,29 @@ async def main() -> None:
         # 参数是扁平的，缺字段在执行时报出是哪个动作、哪个字段
         missing = await plugin.handle_desktop([{"action": "observe"}, {"action": "click", "y": 10}], stream_id="owner")
         assert not missing["success"] and "第 2 個動作缺少或填錯欄位：'x'" in missing["error"], missing
-        # desktop 的 read 只读已打开的分页
-        opened = await plugin.handle_desktop([{"action": "read", "target": target}], stream_id="owner")
-        assert json.loads(opened["content"])["results"][0]["result"]["title"] == "Example Domain", opened
+        assert "content_items" not in cdp, "批次里没有 observe 就不截图"
+        # read 不填 target 就读目前显示的分页，也就是刚 open 的 example.com，回传原文
+        opened = await plugin.handle_desktop([{"action": "read"}], stream_id="owner")
+        raw = json.loads(opened["content"])["results"][0]["result"]
+        assert raw["title"] == "Example Domain" and "domain" in raw["text"] and raw["links"], raw
+        # elements：example.com 唯一的链接在视口下方，只标 where 不给坐标
+        listed = await plugin.handle_desktop([{"action": "elements"}], stream_id="owner")
+        found = json.loads(listed["content"])["results"][0]["result"]["elements"]
+        assert any(e["kind"] == "a" and e.get("where") == "below" and "x" not in e for e in found), found
+        # 本地页面（下面的拦截测试也用这个服务）：视口里的链接给坐标，直接 click 会跳过去
+        await plugin.handle_shell("mkdir -p /tmp/www && echo '<title>Just a moment...</title>' > /tmp/www/block.html && "
+                                  "echo '<a href=\"/block.html\" style=\"font-size:40px\">go</a>' > /tmp/www/link.html && "
+                                  "(setsid python3 -m http.server 8765 --bind 127.0.0.1 --directory /tmp/www "
+                                  ">/dev/null 2>&1 &) && sleep 1", stream_id="owner")
+        local = await plugin.handle_desktop([{"action": "open", "path": "http://127.0.0.1:8765/link.html"},
+                                             {"action": "wait", "seconds": 2}, {"action": "elements"}], stream_id="owner")
+        steps = json.loads(local["content"])["results"]
+        link = next(e for e in steps[2]["result"]["elements"] if e["kind"] == "a")
+        await plugin.handle_desktop([{"action": "click", "x": link["x"], "y": link["y"]}, {"action": "wait", "seconds": 2}],
+                                    stream_id="owner")
+        jumped = await plugin.handle_desktop([{"action": "browser", "method": "Runtime.evaluate", "target": steps[0]["result"]["target"],
+                                               "params": {"expression": "location.href"}}], stream_id="owner")
+        assert json.loads(jumped["content"])["results"][0]["result"]["result"]["result"]["value"].endswith("/block.html"), link
 
         async def tab_ids() -> list:
             listed = await plugin.handle_desktop([{"action": "browser", "method": "targets"}], stream_id="owner")
@@ -238,35 +267,53 @@ async def main() -> None:
         async def tab_count() -> int:
             return len(await tab_ids())
 
+        # linux_read_page 像 WebFetch：原文和连结交给小模型按 prompt 摘取，只回传摘要。这里用假模型代替
+        asked = []
+
+        async def fake_model(text: str) -> str:
+            asked.append(text)
+            return "摘要"
+
+        plugin._ask_model = fake_model
         tabs = await tab_count()
-        page = await plugin.handle_read_page(url="https://example.com", stream_id="owner")  # 旧版单个 url 参数
+        page = await plugin.handle_read_page(url="https://example.com", prompt="這頁在講什麼", stream_id="owner")  # 旧版 url 参数
         read = json.loads(page["content"])["results"][0]["result"]["pages"][0]
         assert page["success"] and "content_items" not in page, page
-        assert read["title"] == "Example Domain" and "domain" in read["text"], read
-        assert any("iana.org" in link["url"] for link in read["links"]), read["links"]
+        assert read["title"] == "Example Domain" and read["answer"] == "摘要" and "text" not in read, read
+        assert "問題：這頁在講什麼" in asked[0] and "domain" in asked[0] and "iana.org" in asked[0], asked
+        nop = await plugin.handle_read_page(["https://example.com"], stream_id="owner")
+        assert not nop["success"] and "prompt" in nop["error"], nop
+        # 摘取失败时退回原文前段
+        async def broken_model(text: str) -> str:
+            return ""
+
+        plugin._ask_model = broken_model
+        fallback = await plugin.handle_read_page(["https://example.com"], prompt="x", stream_id="owner")
+        fallback_page = json.loads(fallback["content"])["results"][0]["result"]["pages"][0]
+        assert fallback_page["answer_error"] and "domain" in fallback_page["text"], fallback_page
+        plugin._ask_model = fake_model
         # 一次并行读多个：打不开的只在自己那一项报错
-        mixed = await plugin.handle_read_page(["https://example.com", "https://nonexistent.invalid"], stream_id="owner")
+        mixed = await plugin.handle_read_page(["https://example.com", "https://nonexistent.invalid"], prompt="x",
+                                              stream_id="owner")
         pages = json.loads(mixed["content"])["results"][0]["result"]["pages"]
-        assert mixed["success"] and pages[0]["title"] == "Example Domain" and "開啟失敗" in pages[1]["error"], pages
-        bad = await plugin.handle_read_page(["https://nonexistent.invalid"], stream_id="owner")
+        assert mixed["success"] and pages[0]["answer"] == "摘要" and "開啟失敗" in pages[1]["error"], pages
+        bad = await plugin.handle_read_page(["https://nonexistent.invalid"], prompt="x", stream_id="owner")
         assert not bad["success"] and "開啟失敗" in bad["error"] and "linux_desktop" in bad["error"], bad
         # 被拦截或 HTTP 错误：标出原因，附上改用桌面的提示；正常页面不标
-        await plugin.handle_shell("mkdir -p /tmp/www && echo '<title>Just a moment...</title>' > /tmp/www/block.html && "
-                                  "(setsid python3 -m http.server 8765 --bind 127.0.0.1 --directory /tmp/www "
-                                  ">/dev/null 2>&1 &) && sleep 1", stream_id="owner")
         blocked = await plugin.handle_read_page(["http://127.0.0.1:8765/block.html", "http://127.0.0.1:8765/missing",
-                                                 "https://example.com"], stream_id="owner")
+                                                 "https://example.com"], prompt="x", stream_id="owner")
         result = json.loads(blocked["content"])["results"][0]["result"]
         assert [page.get("problem") for page in result["pages"]] == ["像是驗證或阻擋頁面", "HTTP 404", None], result
         assert "linux_desktop" in result["hint"], result
         assert await tab_count() == tabs, "read tabs must be closed"
 
-        # max_tabs=2：再开两个网页后，最早由 open 打开的 example.com 标签页被自动关闭
+        # max_tabs=2：再开两个网页后，之前用 open 打开的 example.com 和本地页面两个分页被自动关闭
         more = await plugin.handle_desktop([{"action": "open", "path": "https://example.com/?2"},
                                             {"action": "open", "path": "https://example.com/?3"}], stream_id="owner")
         newest = [step["result"]["target"] for step in json.loads(more["content"])["results"]]
         ids = await tab_ids()
-        assert target not in ids and all(tab in ids for tab in newest) and len(ids) == tabs + 1, (target, newest, ids)
+        closed = [target, steps[0]["result"]["target"]]
+        assert not set(closed) & set(ids) and all(tab in ids for tab in newest) and len(ids) == tabs, (closed, newest, ids)
 
         running = await plugin.handle_shell("sleep 30; echo done", timeout=1, stream_id="owner")
         operation_id = json.loads(running["content"])["operation_id"]

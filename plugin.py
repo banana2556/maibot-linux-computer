@@ -37,6 +37,9 @@ SUBAGENT_PREFERENCE = (
 # 主程序 deferred tools 提示（runtime.build_deferred_tools_reminder）的开头和每行「N. 名称: 描述」
 DEFERRED_REMINDER = "以下工具当前未直接暴露给你"
 DEFERRED_LINE = re.compile(r"^\d+\. ([^\s:]+)", re.M)
+# 算「在桌面上操作过」的 linux_desktop 动作；只读网页的 open、read、elements 不算
+GUI_ACTIONS = {"observe", "move", "click", "double_click", "drag", "mouse_down", "mouse_up", "scroll",
+               "keys", "key_down", "key_up", "type"}
 # 操作超时返回 running 时的说明；hook 看到它就直接载入 deferred 的 linux_poll（连同整组 linux 工具）
 RUNNING_MESSAGE = "操作仍在執行，用 linux_poll 繼續等待；沒有重複執行。"
 # 主程序 tool_search 结果里命中的每行「- 名称（本次新发现）」
@@ -117,7 +120,7 @@ def add_progress_reminder(
                  "timestamp": items[end]["meta"]["timestamp"]},
         "parts": [{"type": "text", "text": f"<system-reminder>\n你已經在電腦上連續操作了 {len(calls)} 步，"
                    "這段時間對方沒收到你的任何訊息，不知道進度。用一兩句話告訴對方你在做什麼、做到哪一步，"
-                   "畫面有參考價值時可以附上截圖；這句話和下一步操作放在同一輪一起發出，不要為此單獨佔一輪。"
+                   "畫面有參考價值時可以 observe 截圖附上；這句話和下一步操作放在同一輪一起發出，不要為此單獨佔一輪。"
                    "\n</system-reminder>"}],
     }
     return [*items[:end + 1], reminder, *items[end + 1:]]
@@ -209,28 +212,49 @@ def apply_tool_catalog(
 
 
 def add_screenshot_reminder(items: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-    """麦麦上次说话后用过 linux_desktop 时，要求回复附上最新截图；没有带截图的桌面操作时返回 None。
+    """麦麦上次说话后在桌面上操作过（点击、输入、截图等）时，要求回复附上最新截图；否则返回 None。
 
-    提醒插在最近一次带截图的 linux_desktop 那批工具结果（及其截图）之后，给出 reply 的 attach_pic 要填的 media_index。
+    只用 open、read、elements 读网页不算操作，不必每次查资料都附图。操作之后有截图就给出 reply 的 attach_pic
+    要填的 media_index，还没有就要求先 observe 截一张。提醒插在最近一次 linux_desktop 那批工具结果（及其截图）之后。
     """
     spoke = max((index for index, item in enumerate(items) if _is_own_message(item)), default=-1)
-    calls = {item["tool_call"]["call_id"] for item in items[spoke + 1:] if item.get("item_type") == "FunctionCallItem"
-             and item["tool_call"]["func_name"] == "linux_desktop"}
-    # 主程序把工具返回的图片拆成媒体消息，并在结果文字里附 <tool_result_media_list>；截图是第 1 个媒体
-    shots = [index for index, item in enumerate(items) if item.get("item_type") == "FunctionCallOutputItem"
-             and item.get("call_id") in calls and "<tool_result_media_list>" in str(item.get("output", ""))]
-    if not shots:
+    desktop = [(index, item["tool_call"]) for index, item in enumerate(items) if index > spoke
+               and item.get("item_type") == "FunctionCallItem" and item["tool_call"]["func_name"] == "linux_desktop"]
+    operated = [index for index, call in desktop if any(
+        isinstance(action, dict) and action.get("action") in GUI_ACTIONS for action in _call_args(call).get("actions", []))]
+    if not operated:
         return None
-    call_id = items[shots[-1]]["call_id"]
-    end = _after_tool_results(items, shots[-1])
+    later = {call["call_id"] for index, call in desktop if index >= operated[-1]}
+    outputs = [index for index, item in enumerate(items)
+               if item.get("item_type") == "FunctionCallOutputItem" and item.get("call_id") in later]
+    if not outputs:
+        return None
+    # 主程序把工具返回的图片拆成媒体消息，并在结果文字里附 <tool_result_media_list>；截图是第 1 个媒体
+    shots = [index for index in outputs if "<tool_result_media_list>" in str(items[index].get("output", ""))]
+    if shots:
+        text = (f"你這段時間在桌面上操作過。回覆對方時一定要附上最新的截圖：reply 的 attach_pic 填 "
+                f"media_index=tool_result:{items[shots[-1]]['call_id']}:1，讓對方看到實際畫面。")
+    else:
+        text = "你這段時間在桌面上操作過，但操作後還沒有截圖。回覆對方前先用 linux_desktop 執行 observe 截一張目前的畫面，再用 reply 的 attach_pic 附上。"
+    end = _after_tool_results(items, outputs[-1])
     reminder = {
         "item_type": "UserMessageItem",
         "meta": {"item_id": f"screenshot-reminder-{items[end]['meta']['item_id']}", "logical_turn_id": None,
                  "timestamp": items[end]["meta"]["timestamp"]},
-        "parts": [{"type": "text", "text": "<system-reminder>\n你這段時間在桌面上操作過。回覆對方時一定要附上最新的截圖："
-                   f"reply 的 attach_pic 填 media_index=tool_result:{call_id}:1，讓對方看到實際畫面。\n</system-reminder>"}],
+        "parts": [{"type": "text", "text": f"<system-reminder>\n{text}\n</system-reminder>"}],
     }
     return [*items[:end + 1], reminder, *items[end + 1:]]
+
+
+def _call_args(call: Dict[str, Any]) -> Dict[str, Any]:
+    """工具调用参数；有的模型给的是 JSON 字符串。"""
+    args = call.get("args")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return {}
+    return args if isinstance(args, dict) else {}
 
 
 def _after_tool_results(items: List[Dict[str, Any]], index: int) -> int:
@@ -261,8 +285,9 @@ def _is_own_message(item: Dict[str, Any]) -> bool:
 DESKTOP_ACTION = {"type": "object", "properties": {
     "action": {"type": "string", "enum": [
         "observe", "move", "click", "double_click", "drag", "mouse_down", "mouse_up", "release", "scroll",
-        "keys", "key_down", "key_up", "type", "open", "shell", "wait", "wait_window", "wait_process", "browser", "read"],
-        "description": "observe：只截圖\n"
+        "keys", "key_down", "key_up", "type", "open", "shell", "wait", "wait_window", "wait_process", "browser", "read",
+        "elements"],
+        "description": "observe：批次結束時回傳截圖；批次裡沒有 observe 就不截圖\n"
         "move、click、double_click：x、y，可加 button\n"
         "drag：從 x、y 拖到 end_x、end_y，可加 seconds、button\n"
         "mouse_down、mouse_up：可加 button；release：放開所有按鍵和滑鼠\n"
@@ -273,7 +298,9 @@ DESKTOP_ACTION = {"type": "object", "properties": {
         "shell：command\n"
         "wait：seconds；wait_window：title、seconds；wait_process：pid、seconds\n"
         "browser：method 呼叫 Chromium CDP（targets 列出分頁），可加 target、params\n"
-        "read：target，讀已開啟分頁的內文"},
+        "read：分頁的完整原文和連結；不填 target 就讀目前顯示的分頁，例如先 open 網址再 read\n"
+        "elements：目前分頁可以點的連結、按鈕、輸入框和座標 x、y（和截圖同比例，可直接 click）；"
+        "不在畫面裡的只標 where（above、below），scroll 後再取一次；可加 target"},
     "x": {"type": "number"}, "y": {"type": "number"}, "end_x": {"type": "number"}, "end_y": {"type": "number"},
     "button": {"type": "string", "enum": ["left", "right", "middle"]},
     "delta": {"type": "integer"},
@@ -289,6 +316,27 @@ URLS_SCHEMA = {"type": "array", "items": {"type": "string", "pattern": "^https?:
                "description": "要讀取的網址，最多 5 個，同時開啟並行讀取"}
 TIMEOUT_SCHEMA = {"type": "number", "minimum": 0, "maximum": MAX_WAIT_SECONDS,
                   "description": f"最多等待秒數，預設 60，上限 {MAX_WAIT_SECONDS}；逾時回傳 running 和 operation_id"}
+# linux_read_page 像 Claude Code 的 WebFetch：原文交给小模型按 prompt 摘取，只有摘要进 Planner 上下文
+EXTRACT_TEXT_LIMIT = 15000  # 每页交给小模型的正文上限
+EXTRACT_LINKS = 40
+EXTRACT_TIMEOUT_MS = 120000
+PAGE_TEXT_FALLBACK = 3000  # 摘取失败时退回的原文字数
+EXTRACT_PROMPT = """你負責從網頁內容裡找出和問題相關的資訊，結果會交給另一個助理回覆使用者。
+問題：{prompt}
+網址：{url}
+標題：{title}
+
+規則：
+- 只寫和問題相關的內容，用繁體中文，越精簡越好，最多 800 字。
+- 保留具體的數字、日期、版本和名稱；重要的句子可以短短引用原文。
+- 問題需要繼續查的話，從下面的頁面連結裡列出最相關的幾個，格式「標題：網址」，網址照原樣寫。
+- 這頁和問題無關或找不到答案，就直接說「這頁沒有相關資訊」，不要編造。
+
+網頁內文：
+{text}
+
+頁面連結：
+{links}"""
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -320,7 +368,9 @@ class ComputerSectionConfig(PluginConfigBase):
     progress_reminder_seconds: int = Field(
         default=60, description="连续操作电脑超过这么多秒、期间没在聊天里说过话时，提醒麦麦先说一下进展；0 为关闭")
     desktop_reply_screenshot: bool = Field(
-        default=True, description="上次说话后用过 linux_desktop 时，要求麦麦回复时附上最新的截图")
+        default=True, description="上次说话后在桌面上操作过（点击、输入、截图等）时，要求麦麦回复时附上最新的截图")
+    extract_task: str = Field(
+        default="utils", description="linux_read_page 依 prompt 摘取网页重点用的模型任务（model_config 里的任务名），建议用快的小模型")
     prefer_subagent: bool = Field(
         default=True, description="在 Planner 提示词里要求查资料时尽量交给子代理；主程序开启 planner_subagent 时才生效")
     tool_catalog: bool = Field(
@@ -384,9 +434,10 @@ class LinuxComputerPlugin(MaiBotPlugin):
 
     @Tool(
         "linux_desktop",
-        description="在 Linux 沙盒電腦的圖形桌面上依序執行 actions，最後回傳截圖。"
-        "需要看畫面、點擊、輸入、登入，或 linux_read_page 讀取失敗、被阻擋時用它；只讀網頁文字用 linux_read_page。"
-        "座標依最新截圖，不確定畫面時先 observe。逾時回傳 running，用 linux_poll 等待，不要重複操作。",
+        description="在 Linux 沙盒電腦的圖形桌面上依序執行 actions。需要看畫面、點擊、輸入、登入、讀網頁完整原文，"
+        "或 linux_read_page 讀取失敗、被阻擋時用它；只想知道網頁裡的某件事用 linux_read_page。"
+        "批次裡有 observe 才回傳截圖；看不到圖時用 elements 取得可以點的元素和座標。"
+        "逾時回傳 running，用 linux_poll 等待，不要重複操作。",
         parameters={"type": "object", "properties": {
             "actions": {"type": "array", "items": DESKTOP_ACTION, "minItems": 1},
             "timeout": TIMEOUT_SCHEMA,
@@ -397,33 +448,74 @@ class LinuxComputerPlugin(MaiBotPlugin):
     async def handle_desktop(
         self, actions: List[Dict[str, Any]], timeout: float = 60, stream_id: str = "", **kwargs: Any,
     ) -> Dict[str, Any]:
-        """执行桌面动作并截图。"""
+        """执行桌面动作；批次里有 observe 才截图。"""
         del kwargs
-        return await self._safe(self._submit(actions, timeout, stream_id, screenshot=True))
+        screenshot = any(action.get("action") == "observe" for action in actions)
+        return await self._safe(self._submit(actions, timeout, stream_id, screenshot=screenshot))
 
     @Tool(
         "linux_read_page",
-        description="用你 Linux 電腦裡的 Chromium 開啟網址並讀取頁面，回傳最終網址、標題、內文和頁面上的連結（links），不截圖。"
-        "看連結或網頁內容時用它：頁面真實渲染、會執行 JavaScript，並帶著在這台電腦上登入過的狀態。"
+        description="用你 Linux 電腦裡的 Chromium 開啟網址（會執行 JavaScript，帶著這台電腦上的登入狀態），"
+        "讀完由小模型依 prompt 擷取相關內容，只回傳摘要和相關連結，不回傳原文。"
         "要看幾個網址就一次全放進 urls 並行讀取，不要一輪讀一個。"
-        "搜尋時讀取 https://html.duckduckgo.com/html/?q=關鍵字（Google 會攔截自動存取），"
-        "摘要不夠回答時，從 links 裡挑 2～3 個最相關的結果一次開啟；資訊足夠回答就停，不要為了更完整一直讀下去。"
+        "搜尋時讀 https://html.duckduckgo.com/html/?q=關鍵字（Google 會攔截自動存取），prompt 寫要找什麼，"
+        "例如「列出 FFXIV 7.4 官方更新說明的連結」；摘要不夠再挑 2～3 個結果一次讀，資訊足夠回答就停。"
         "需要搜尋加讀好幾頁的資料查詢，優先交給 subagent 並授權本工具，你繼續聊天。"
-        "每次在新分頁開啟、讀完關閉；讀取失敗、被阻擋，或需要看畫面、點擊、登入時改用 linux_desktop。",
-        parameters={"type": "object", "properties": {"urls": URLS_SCHEMA, "timeout": TIMEOUT_SCHEMA},
-                    "required": ["urls"], "additionalProperties": False},
+        "要完整原文、看畫面、點擊、登入，或讀取失敗、被阻擋時改用 linux_desktop。",
+        parameters={"type": "object", "properties": {
+            "urls": URLS_SCHEMA,
+            "prompt": {"type": "string", "description": "想從這些網頁知道什麼，例如「7.4 版有哪些新內容」；只會回傳和它相關的部分"},
+            "timeout": TIMEOUT_SCHEMA,
+        }, "required": ["urls", "prompt"], "additionalProperties": False},
         visibility="visible",
         timeout_ms=TOOL_RPC_TIMEOUT_MS,
     )
     async def handle_read_page(
-        self, urls: Optional[List[str]] = None, timeout: float = 60, stream_id: str = "", **kwargs: Any,
+        self, urls: Optional[List[str]] = None, prompt: str = "", timeout: float = 60, stream_id: str = "", **kwargs: Any,
     ) -> Dict[str, Any]:
-        """并行读取网页文字，不截图；兼容旧版单个 url 参数。"""
+        """并行读取网页，交给小模型按 prompt 摘取；兼容旧版单个 url 参数。"""
         if not urls and kwargs.get("url"):
             urls = [kwargs["url"]]
         if not urls:
             return {"success": False, "error": "需要至少一個網址（urls）。"}
-        return await self._safe(self._submit([{"action": "read", "urls": urls[:5]}], timeout, stream_id, screenshot=False))
+        if not prompt.strip():
+            return {"success": False, "error": "需要 prompt：寫想從這些網頁知道什麼。要完整原文請用 linux_desktop 的 open 加 read。"}
+        action = {"action": "read", "urls": urls[:5], "text_limit": EXTRACT_TEXT_LIMIT, "link_limit": EXTRACT_LINKS}
+        return await self._safe(self._submit([action], timeout, stream_id, screenshot=False,
+                                             post=lambda result: self._extract(result, prompt)))
+
+    async def _extract(self, result: Dict[str, Any], prompt: str) -> Dict[str, Any]:
+        """每页原文分别交给小模型按 prompt 摘取，读取失败或被拦截的页面原样保留原因。"""
+        if not result.get("success"):
+            return result
+        step = result["results"][0]
+        pages = await asyncio.gather(*(self._extract_page(page, prompt) for page in step["result"]["pages"]))
+        return {**result, "results": [{**step, "result": {**step["result"], "pages": list(pages)}}]}
+
+    async def _extract_page(self, page: Dict[str, Any], prompt: str) -> Dict[str, Any]:
+        brief = {key: page[key] for key in ("url", "title", "note", "error", "problem") if key in page}
+        if "error" in page or "problem" in page:
+            return brief
+        links = "\n".join(f"- {link['text']}：{link['url']}" for link in page.get("links", [])) or "（沒有）"
+        answer = await self._ask_model(EXTRACT_PROMPT.format(
+            prompt=prompt, url=page["url"], title=page["title"], text=page["text"], links=links))
+        if answer:
+            return {**brief, "answer": answer}
+        # 摘取失败时退回原文前段，至少不让这次读取白费
+        return {**brief, "answer_error": "擷取失敗，以下是原文前段", "text": page["text"][:PAGE_TEXT_FALLBACK]}
+
+    async def _ask_model(self, text: str) -> str:
+        """用 extract_task 指定的模型回答；失败时返回空字符串。"""
+        try:
+            reply = await self.ctx.call_capability("llm.generate", timeout_ms=EXTRACT_TIMEOUT_MS, prompt=text,
+                                                   model="", task_name=self.config.computer.extract_task, max_tokens=1200)
+        except Exception as exc:  # 能力调用失败不影响读取结果
+            self.ctx.logger.warning(f"网页摘取失败：{exc}")
+            return ""
+        if isinstance(reply, dict) and reply.get("success") and str(reply.get("response") or "").strip():
+            return str(reply["response"]).strip()
+        self.ctx.logger.warning(f"网页摘取没有结果：{reply.get('error') if isinstance(reply, dict) else reply}")
+        return ""
 
     @Tool(
         "linux_poll",
@@ -531,13 +623,20 @@ class LinuxComputerPlugin(MaiBotPlugin):
 
     async def _submit(
         self, actions: List[Dict[str, Any]], timeout: float, stream_id: str, *, screenshot: bool,
+        post: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        """post 在同一个操作里处理执行器结果（例如摘取网页），超时后用 linux_poll 拿到的也是处理过的结果。"""
         self._check_chat(stream_id)
         await self._ensure()
         operation_id = uuid4().hex
         request = {"actions": actions, "screenshot": screenshot, "max_edge": self.config.computer.screenshot_max_edge,
                    "max_tabs": self.config.computer.max_tabs}
-        self._operations[operation_id] = asyncio.create_task(self._guest("run", operation_id, request))
+
+        async def work() -> Dict[str, Any]:
+            result = await self._guest("run", operation_id, request)
+            return await post(result) if post else result
+
+        self._operations[operation_id] = asyncio.create_task(work())
         # ponytail: 只保留最近的操作，插件重启后旧操作无法再查询；容器里的进程不受影响
         for stale in list(self._operations)[:-KEPT_OPERATIONS]:
             if self._operations[stale].done():

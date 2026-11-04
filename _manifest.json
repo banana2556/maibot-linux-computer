@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.11.0",
+  "version": "1.12.0",
   "name": "Linux 沙盒电脑",
   "description": "让麦麦的 Planner 直接操作 Docker 容器里的 Linux 桌面、Chromium 浏览器和终端，可在 VPS 上自主搜索、安装软件；聊天里出现链接时提醒先打开查看内容",
   "author": {
@@ -28,7 +28,7 @@
       "background": "#1C272C"
     }
   },
-  "capabilities": ["tool.get_definitions"],
+  "capabilities": ["tool.get_definitions", "llm.generate"],
   "i18n": {
     "default_locale": "zh-CN"
   },

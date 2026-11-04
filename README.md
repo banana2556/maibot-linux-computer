@@ -11,13 +11,13 @@
 | 工具 | 用途 |
 |---|---|
 | `linux_shell` | 执行 bash（root），返回 stdout/stderr/exit_code，不截图 |
-| `linux_read_page` | 用 Chromium 打开网址（一次最多 5 个，并行读取），返回最终网址、标题、正文文字和页面上的链接，不截图；每个网址单独标签页、读完关闭，多个聊天同时读互不干扰 |
-| `linux_desktop` | 批量桌面动作（点击、输入、按键、拖拽、打开程序/网址、CDP 调用、`read` 读已打开分页的正文……），返回截图 |
+| `linux_read_page` | 像 Claude Code 的 WebFetch：用 Chromium 打开网址（一次最多 5 个，并行），原文交给小模型按必填的 `prompt` 摘取，只返回摘要和相关链接；每个网址单独标签页、读完关闭 |
+| `linux_desktop` | 批量桌面动作（点击、输入、按键、拖拽、打开程序/网址、CDP 调用；`read` 读当前分页的完整原文，`elements` 列出可点元素和坐标），批次里有 `observe` 才返回截图 |
 | `linux_poll` | 继续等待超时返回 `running` 的操作，不重复执行 |
 | `linux_cancel` | 终止运行中的操作及其子进程 |
 
 麦麦是模拟真人聊天的 bot，看网页远比装软件常见，工具按这个分层：`linux_read_page`、`linux_desktop` 一直可见
-（两个合计约 2600 字，每轮都会带上）；`linux_shell`、`linux_poll`、`linux_cancel` 是 deferred，第一次要用时先 `tool_search`，三个会一起载入。操作超时返回 running 时，插件直接把这一组载入，下一轮就能 `linux_poll`。
+（两个合计约 2900 字，每轮都会带上）；`linux_shell`、`linux_poll`、`linux_cancel` 是 deferred，第一次要用时先 `tool_search`，三个会一起载入。操作超时返回 running 时，插件直接把这一组载入，下一轮就能 `linux_poll`。
 参照 Claude Code 的工具写法：`linux_desktop` 的参数摊平成一个 `action` 选项加选填字段，每个动作要填什么只在 `action` 的说明里写一次，缺字段时执行结果会指出是第几个动作、哪个字段；工具说明只写什么时候用、什么时候不用。只有 deferred 的三个工具在说明里列了使用者会说的动词和同义词（安裝、等待、停止、install、kill……），供 `tool_search` 检索。
 
 ## 工具目录（`tool_catalog`）
@@ -35,8 +35,18 @@
 看网页走浏览器：页面真实渲染、执行 JavaScript，并带着在这台电脑上登录过的状态（例如在 noVNC 里手动登录过的网站）。
 主程序的 `web_search` / `web_fetch` 可以关掉，对话模型自带联网时搜索交给模型本身。
 
+参照 Claude Code 的 WebFetch / 浏览器工具分工：
+
+- `linux_read_page`：只想知道网页里的某件事。每页原文（最多 1.5 万字）和链接交给 `extract_task` 指定的模型（默认 `utils`），
+  按 `prompt` 摘出相关内容、列出要继续看的链接，只有摘要进 Planner 上下文。摘取失败时退回原文前 3000 字。
+  每页多一次小模型调用，会慢几秒；超时返回 running 时，`linux_poll` 拿到的也是摘好的结果。
+- `linux_desktop` 的 `read`：要完整原文时用，例如 `[open 网址, read]`；不填 target 就读当前显示的分页。
+- 截图是 `observe` 动作，批次里有它才截，只读文字的批次不附图。
+- `elements` 列出当前分页里可以点的链接、按钮、输入框和坐标（和截图同比例，可直接 `click`），
+  不在画面里的只标 `where`（above/below），滚动后再取；Planner 看不了图时也能照文字清单操作。
+
 用浏览器搜索时，工具说明引导麦麦读取 DuckDuckGo 的 HTML 版（Google 会对自动访问弹出验证），
-结果链接会还原成真实网址放在 `links` 里，麦麦可以挑相关结果继续打开正文。
+`prompt` 写要找什么，摘要里会列出相关结果的真实网址，麦麦可以挑几个继续读。
 
 网页读取失败或被拦截时（打不开、HTTP 4xx/5xx、Cloudflare/Google 之类的验证页、页面没有文字），
 对应那页带 `problem` 说明原因，结果附上改用 `linux_desktop` 打开看实际画面的提示，
@@ -44,8 +54,7 @@
 
 为了少跑轮数，工具说明要求：几个网址一次放进 `urls` 并行读；通常挑 2～3 个最相关的结果，信息够了就停；
 需要搜索加读好几页的查询优先交给后台子代理（需开启 `planner_subagent` 和 `advanced_sub_agent`）。
-一次读取的正文合计约 1.2 万字、链接合计 40 个（多页时平分），因为结果会整段留在 Planner 上下文里，后续每轮都重复携带；
-更长的页面会截断。想进一步省上下文可以在 `bot_config.toml` 开启 `tool_result_condense`，长结果会先整理成结论。
+`linux_desktop` 的 `read` 返回的原文合计约 1.2 万字、链接 40 个，因为会整段留在 Planner 上下文里，更长的页面会截断。
 
 工具说明、提醒和返回给模型的提示都用繁体中文；WebUI 配置说明和本文档仍是简体。
 
@@ -66,8 +75,9 @@
 并且和下一步操作放在同一轮一起发出，不单独占一轮。
 说话后重新计时，所以长任务里大约每分钟会汇报一次；设为 0 关闭。
 
-麦麦上次说话后用过 `linux_desktop` 时（`desktop_reply_screenshot`，默认开启），同一个 hook 在那批工具结果和截图之后插入提醒：
-回复时一定要附上最新截图，并直接给出 `reply` 的 `attach_pic` 要填的 `media_index=tool_result:<call_id>:1`。
+麦麦上次说话后在桌面上操作过（点击、输入、按键、滚动、截图等；只用 `open`、`read`、`elements` 读网页不算）时
+（`desktop_reply_screenshot`，默认开启），同一个 hook 在那批工具结果和截图之后插入提醒：回复时一定要附上最新截图。
+操作后有截图就直接给出 `reply` 的 `attach_pic` 要填的 `media_index=tool_result:<call_id>:1`，还没有就要求先 `observe` 截一张。
 
 只对 Planner 自己操作有效。后台子代理不能在聊天里说话，它工作时可以问麦麦「进度如何」，
 麦麦能随时截一张当前画面（桌面是共用的，看得到子代理正在做什么）；想实时看就用下面的 noVNC。
@@ -110,7 +120,8 @@ advanced_sub_agent = true
 | `computer.screenshot_max_edge` | 截图最长边，越小越省 token |
 | `computer.max_tabs` | 麦麦打开的网页标签页上限，默认 5，0 为不限制 |
 | `computer.progress_reminder_seconds` | 连续操作多少秒没说话就提醒汇报进度，默认 60，0 为关闭 |
-| `computer.desktop_reply_screenshot` | 上次说话后用过 `linux_desktop` 时，要求回复附上最新截图，默认开启 |
+| `computer.desktop_reply_screenshot` | 上次说话后在桌面上操作过时，要求回复附上最新截图，默认开启 |
+| `computer.extract_task` | `linux_read_page` 按 `prompt` 摘取网页用的模型任务（`model_config` 里的任务名），默认 `utils`，建议用快的小模型 |
 | `computer.prefer_subagent` | 在 Planner 系统提示词末尾要求查资料（搜索、读网页、比对信息）尽量交给子代理，只有打开单个链接这种一步完成的事自己做；默认开启，主程序没开 `planner_subagent` 时不生效 |
 | `computer.tool_catalog` | 接管 Planner 的 deferred tools（类别目录、整组载入、会话内保持、顺序固定），默认开启；关闭后交回主程序原本的 `tool_search` |
 

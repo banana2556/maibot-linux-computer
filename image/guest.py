@@ -47,6 +47,28 @@ BLOCKED_PAGE = re.compile(r"just a moment|attention required|access denied|verif
                           r"captcha|are you a robot|unusual traffic|請稍候|人机验证|人機驗證|安全验证|安全驗證", re.I)
 # 读不到正文时提示改用一直可见的 linux_desktop 看实际画面
 READ_FALLBACK = "有網頁讀取失敗或被阻擋：改用 linux_desktop 開啟這些網址看實際畫面。"
+MAX_ELEMENTS = 80
+# 前台分页里看得到、可以点或输入的元素，坐标是屏幕像素（元素在视口里的中心 + 浏览器窗口在屏幕上的偏移）
+# ponytail: 按 devicePixelRatio=1、窗口最大化无左右边框计算；Xvfb 里就是这样，换显示环境要再校准
+ELEMENTS_SCRIPT = """(() => {
+  const side = (outerWidth - innerWidth) / 2, left = screenX + side, top = screenY + outerHeight - innerHeight - side;
+  const out = [];
+  for (const el of document.querySelectorAll('a[href],button,input:not([type=hidden]),select,textarea,summary,'
+      + '[role=button],[role=link],[role=tab],[role=checkbox],[role=menuitem],[onclick],[contenteditable=true]')) {
+    const r = el.getBoundingClientRect(), style = getComputedStyle(el);
+    if (!r.width || !r.height || r.right < 0 || r.left > innerWidth
+        || style.visibility === 'hidden' || style.display === 'none') continue;
+    const text = (el.innerText || el.getAttribute('aria-label') || el.placeholder || el.value || el.title || el.alt
+                  || el.name || '').replace(/\\s+/g, ' ').trim().slice(0, 60);
+    const kind = el.getAttribute('role') || el.tagName.toLowerCase() + (el.type && el.tagName !== 'A' ? ':' + el.type : '');
+    // 不在视口里的不给坐标，标出在上面还是下面，捲动后再取
+    if (r.bottom < 0 || r.top > innerHeight) out.push({kind, text, where: r.top > innerHeight ? 'below' : 'above'});
+    else out.push({kind, text, x: left + (Math.max(r.left, 0) + Math.min(r.right, innerWidth)) / 2,
+                   y: top + (Math.max(r.top, 0) + Math.min(r.bottom, innerHeight)) / 2});
+    if (out.length >= MAX_ELEMENTS) break;
+  }
+  return out;
+})()"""
 OUTPUT_LIMIT = 20000
 BUTTONS = {"left": 1, "middle": 2, "right": 3}
 MODIFIERS = ("ctrl", "alt", "shift", "super")
@@ -190,9 +212,15 @@ class Desktop:
         elif kind == "browser":
             return browser(action["method"], action.get("target", ""), action.get("params", {}))
         elif kind == "read":
-            if action.get("urls"):
-                return read_pages(action["urls"], action.get("seconds", 20))
-            return read_page("", action.get("target", ""), action.get("seconds", 20))
+            if action.get("urls"):  # linux_read_page：每页上限由插件按用途给出
+                return read_pages(action["urls"], action.get("seconds", 20), action.get("text_limit"), action.get("link_limit"))
+            return read_page("", action.get("target") or current_page()["id"], action.get("seconds", 20))
+        elif kind == "elements":
+            page = current_page(action.get("target", ""))
+            found = cdp_eval(page, ELEMENTS_SCRIPT.replace("MAX_ELEMENTS", str(MAX_ELEMENTS)))
+            # 脚本给的是屏幕坐标，换成和截图一样的比例，模型可以直接拿去 click
+            return {"elements": [{**item, "x": round(item["x"] * self.scale), "y": round(item["y"] * self.scale)}
+                                 if "x" in item else item for item in found]}
         else:
             raise ValueError(f"不支援的桌面動作：{kind}")
         return {}
@@ -306,11 +334,33 @@ def open_tab(url: str, max_tabs: int) -> dict:
     return {"target": page["id"]}
 
 
-def read_pages(urls: list, seconds: float) -> dict:
-    """并行读取多个网址，一个打不开不影响其他，全部失败才算失败；正文字数和链接数按页数平分，总量与读一页相当。"""
+def current_page(target: str = "") -> dict:
+    """浏览器窗口里正在显示的分页；给 target 时先把它切到前台。"""
+    if target:
+        cdp_http(f"/json/activate/{target}")
+    pages = cdp_pages()
+    for page in pages:
+        try:
+            if page["id"] == target or (not target and cdp_eval(page, "document.visibilityState") == "visible"):
+                return page
+        except RuntimeError:
+            continue
+    if not pages:
+        raise RuntimeError("沒有開啟的分頁")
+    if target:
+        raise RuntimeError(f"沒有這個分頁：{target}")
+    return pages[0]
+
+
+def read_pages(urls: list, seconds: float, text_limit: int = None, link_limit: int = None) -> dict:
+    """并行读取多个网址，一个打不开不影响其他，全部失败才算失败。
+
+    没给每页上限时，正文字数和链接数按页数平分，总量与读一页相当。
+    """
     def one(url: str) -> dict:
         try:
-            return read_page(url, "", seconds, PAGE_TEXT_LIMIT // len(urls), MAX_LINKS // len(urls))
+            return read_page(url, "", seconds, text_limit or PAGE_TEXT_LIMIT // len(urls),
+                             link_limit or MAX_LINKS // len(urls))
         except Exception as exc:
             return {"url": url, "error": f"{type(exc).__name__}: {exc}"}
 
