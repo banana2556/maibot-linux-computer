@@ -37,6 +37,8 @@ SUBAGENT_PREFERENCE = (
 # 主程序 deferred tools 提示（runtime.build_deferred_tools_reminder）的开头和每行「N. 名称: 描述」
 DEFERRED_REMINDER = "以下工具当前未直接暴露给你"
 DEFERRED_LINE = re.compile(r"^\d+\. ([^\s:]+)", re.M)
+# guest.py 的 READ_FALLBACK：linux_read_page 读取失败或被拦截时结果里带这句，看到就直接载入 linux_desktop
+READ_FALLBACK_MARK = "改用 linux_desktop 開啟這些網址"
 # 主程序 tool_search 结果里命中的每行「- 名称（本次新发现）」
 SEARCH_HIT = re.compile(r"^- ([^\s（]+)", re.M)
 # ponytail: 整个替换主程序 tool_search 的说明和参数；主程序以后给它加参数时要跟着改
@@ -142,7 +144,7 @@ def namespace(name: str) -> str:
 
 def apply_tool_catalog(
     items: List[Dict[str, Any]], tools: List[Dict[str, Any]], loaded: Dict[str, Dict[str, Any]],
-    pool: Dict[str, None], schemas: Dict[str, Dict[str, Any]],
+    pool: Dict[str, None], schemas: Dict[str, Dict[str, Any]], wanted: Optional[List[str]] = None,
 ) -> tuple:
     """接管 Planner 的 deferred tools，返回新的 (items, tools)。
 
@@ -152,6 +154,7 @@ def apply_tool_catalog(
 
     loaded：本会话已载入的工具（名称→定义，按载入顺序）；pool：本会话见过的 deferred 工具名。两者都原地更新、只追加。
     schemas：插件工具的完整定义，用来整组载入；主程序自带的工具拿不到定义，只能靠搜索载入。
+    wanted：不经搜索直接整组载入的工具，例如网页读取失败后的 linux_desktop。
     """
     reminder = next((index for index, item in enumerate(items) if item.get("item_type") == "UserMessageItem"
                      and any(DEFERRED_REMINDER in part.get("text", "") for part in item.get("parts", []))), None)
@@ -160,7 +163,8 @@ def apply_tool_catalog(
     if reminder is not None:
         items = [*items[:reminder], *items[reminder + 1:]]
     current = {tool_name(definition): definition for definition in tools}
-    discovered = [name for name in current if name not in loaded and name in pool]
+    wanted = wanted or []
+    discovered = [name for name in [*current, *wanted] if name not in loaded and (name in pool or name in wanted)]
     pool.update(dict.fromkeys(deferred))
     for name in list(loaded):
         if name in current:
@@ -414,7 +418,7 @@ class LinuxComputerPlugin(MaiBotPlugin):
         "搜尋時讀取 https://html.duckduckgo.com/html/?q=關鍵字（Google 會攔截自動存取），"
         "摘要不夠回答時，從 links 裡挑 2～3 個最相關的結果一次開啟；資訊足夠回答就停，不要為了更完整一直讀下去。"
         "需要搜尋加讀好幾頁的資料查詢，優先交給 subagent 並授權本工具，你繼續聊天。"
-        "每次在新分頁開啟、讀完關閉；需要看畫面、點擊或登入時改用 linux_desktop。"
+        "每次在新分頁開啟、讀完關閉；讀取失敗、被阻擋，或需要看畫面、點擊、登入時改用 linux_desktop。"
         "用於：搜尋、查資料、上網、Google、看連結、讀網頁、開網址（search, browse, web, url）。",
         parameters={"type": "object", "properties": {"urls": URLS_SCHEMA, "timeout": TIMEOUT_SCHEMA},
                     "required": ["urls"], "additionalProperties": False},
@@ -482,9 +486,11 @@ class LinuxComputerPlugin(MaiBotPlugin):
         result = definitions
         if self.config.computer.tool_catalog and "tool_search" in tools:
             loaded, pool = self._tool_sessions.setdefault(str(kwargs.get("session_id") or ""), ({}, {}))
-            discovering = any(name not in loaded and name in pool for name in tools)
+            wanted = ["linux_desktop"] if any(item.get("item_type") == "FunctionCallOutputItem"
+                                              and READ_FALLBACK_MARK in str(item.get("output", "")) for item in items) else []
+            discovering = any(name not in loaded and (name in pool or name in wanted) for name in [*tools, *wanted])
             items, result = apply_tool_catalog(items, definitions, loaded, pool,
-                                               await self._plugin_tool_schemas() if discovering else {})
+                                               await self._plugin_tool_schemas() if discovering else {}, wanted)
         if items is original and result is definitions:
             return None
         return {"action": "continue", "modified_kwargs": {**kwargs, "items": items, "tool_definitions": result}}

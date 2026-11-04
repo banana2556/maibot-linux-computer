@@ -12,8 +12,8 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from plugin import (LinuxComputerPlugin, add_link_reminder, add_progress_reminder, add_screenshot_reminder,  # noqa: E402
-                    apply_tool_catalog)
+from plugin import (READ_FALLBACK_MARK, LinuxComputerPlugin, add_link_reminder, add_progress_reminder,  # noqa: E402
+                    add_screenshot_reminder, apply_tool_catalog)
 
 NAME = "maibot-linux-computer-selftest"
 
@@ -167,6 +167,12 @@ def check_tool_catalog() -> None:
                                   [tool("reply"), tool("tool_search")], loaded, pool, {})
     assert names(tools) == ["reply", "tool_search", "linux_desktop", "linux_cancel"], tools
 
+    # 网页读取失败：不经搜索直接整组载入 linux_desktop
+    _, tools = apply_tool_catalog([system, reminder("linux_desktop", "linux_cancel")], [tool("reply"), tool("tool_search")],
+                                  {}, {}, {"linux_desktop": tool("linux_desktop"), "linux_cancel": tool("linux_cancel")},
+                                  ["linux_desktop"])
+    assert names(tools) == ["reply", "tool_search", "linux_desktop", "linux_cancel"], tools
+
 
 async def main() -> None:
     check_link_reminder()
@@ -227,7 +233,16 @@ async def main() -> None:
         pages = json.loads(mixed["content"])["results"][0]["result"]["pages"]
         assert mixed["success"] and pages[0]["title"] == "Example Domain" and "開啟失敗" in pages[1]["error"], pages
         bad = await plugin.handle_read_page(["https://nonexistent.invalid"], stream_id="owner")
-        assert not bad["success"] and "開啟失敗" in bad["error"], bad
+        assert not bad["success"] and "開啟失敗" in bad["error"] and READ_FALLBACK_MARK in bad["error"], bad
+        # 被拦截或 HTTP 错误：标出原因，附上改用桌面的提示；正常页面不标
+        await plugin.handle_shell("mkdir -p /tmp/www && echo '<title>Just a moment...</title>' > /tmp/www/block.html && "
+                                  "(setsid python3 -m http.server 8765 --bind 127.0.0.1 --directory /tmp/www "
+                                  ">/dev/null 2>&1 &) && sleep 1", stream_id="owner")
+        blocked = await plugin.handle_read_page(["http://127.0.0.1:8765/block.html", "http://127.0.0.1:8765/missing",
+                                                 "https://example.com"], stream_id="owner")
+        result = json.loads(blocked["content"])["results"][0]["result"]
+        assert [page.get("problem") for page in result["pages"]] == ["像是驗證或阻擋頁面", "HTTP 404", None], result
+        assert READ_FALLBACK_MARK in blocked["content"], result
         assert await tab_count() == tabs, "read tabs must be closed"
 
         # max_tabs=2：再开两个网页后，最早由 open 打开的 example.com 标签页被自动关闭

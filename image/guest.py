@@ -39,8 +39,14 @@ PAGE_SCRIPT = """(() => {
     links.push({text: text.slice(0, 100), url: new URL(a.href).searchParams.get('uddg') || a.href});
     if (links.length >= MAX_LINKS) break;
   }
-  return {url: location.href, title: document.title, text: document.body ? document.body.innerText : '', links};
+  const status = (performance.getEntriesByType('navigation')[0] || {}).responseStatus || 0;
+  return {url: location.href, title: document.title, text: document.body ? document.body.innerText : '', links, status};
 })()"""
+# 验证或拦截页的标题/短正文特征；长文章里提到 captcha 不算
+BLOCKED_PAGE = re.compile(r"just a moment|attention required|access denied|verify you are human|checking your browser|"
+                          r"captcha|are you a robot|unusual traffic|請稍候|人机验证|人機驗證|安全验证|安全驗證", re.I)
+# plugin.py 按这句话认出读取失败，自动把 linux_desktop 载入 Planner
+READ_FALLBACK = "有網頁讀取失敗或被阻擋：改用 linux_desktop 開啟這些網址看實際畫面。"
 OUTPUT_LIMIT = 20000
 BUTTONS = {"left": 1, "middle": 2, "right": 3}
 MODIFIERS = ("ctrl", "alt", "shift", "super")
@@ -312,8 +318,21 @@ def read_pages(urls: list, seconds: float) -> dict:
     with ThreadPoolExecutor(len(urls)) as pool:
         pages = list(pool.map(one, urls))
     if all("error" in page for page in pages):
-        raise RuntimeError("；".join(page["error"] for page in pages))
+        raise RuntimeError("；".join(page["error"] for page in pages) + "\n" + READ_FALLBACK)
+    if any("error" in page or "problem" in page for page in pages):
+        return {"pages": pages, "hint": READ_FALLBACK}
     return {"pages": pages}
+
+
+def page_problem(result: dict, status: int) -> str:
+    """读到的不是正常内容时说明原因：HTTP 错误、验证或拦截页、没有文字；正常页面返回空字符串。"""
+    if status >= 400:
+        return f"HTTP {status}"
+    if BLOCKED_PAGE.search(result["title"]) or (len(result["text"]) < 1500 and BLOCKED_PAGE.search(result["text"])):
+        return "像是驗證或阻擋頁面"
+    if not result["text"].strip():
+        return "頁面沒有文字內容"
+    return ""
 
 
 def read_page(url: str, target: str, seconds: float, text_limit: int = PAGE_TEXT_LIMIT, link_limit: int = MAX_LINKS) -> dict:
@@ -345,6 +364,9 @@ def read_page(url: str, target: str, seconds: float, text_limit: int = PAGE_TEXT
     finally:
         if url:
             cdp_http(f"/json/close/{page['id']}")
+    problem = page_problem(result, result.pop("status"))
+    if problem:
+        result["problem"] = problem
     if len(result["text"]) > text_limit:
         result["text"] = result["text"][:text_limit] + f"\n...[後面還有 {len(result['text']) - text_limit} 字元未顯示]"
     return result
