@@ -16,8 +16,8 @@
 | `linux_poll` | 继续等待超时返回 `running` 的操作，不重复执行 |
 | `linux_cancel` | 终止运行中的操作及其子进程 |
 
-工具按「第一轮就可能要用」分层：`linux_read_page`、`linux_shell`、`linux_poll` 一直可见；
-`linux_desktop`（参数约 5000 字，占全部工具的七成）和 `linux_cancel` 是 deferred，第一次要用时先 `tool_search`，两个会一起载入。
+麦麦是模拟真人聊天的 bot，看网页远比装软件常见，工具按这个分层：`linux_read_page`、`linux_desktop` 一直可见
+（`linux_desktop` 参数约 5000 字，每轮都会带上）；`linux_shell`、`linux_poll`、`linux_cancel` 是 deferred，第一次要用时先 `tool_search`，三个会一起载入。操作超时返回 running 时，插件直接把这一组载入，下一轮就能 `linux_poll`。
 工具说明里列了使用者会说的动词和同义词（截圖、點擊、安裝、搜尋、screenshot、click……），供 `tool_search` 检索。
 
 ## 工具目录（`tool_catalog`）
@@ -40,7 +40,7 @@
 
 网页读取失败或被拦截时（打不开、HTTP 4xx/5xx、Cloudflare/Google 之类的验证页、页面没有文字），
 对应那页带 `problem` 说明原因，结果附上改用 `linux_desktop` 打开看实际画面的提示，
-同时插件把 `linux_desktop` 直接载入 Planner（需开启 `tool_catalog`），下一轮就能用，不必先搜索。
+`linux_desktop` 一直可见，下一轮就能直接用。
 
 为了少跑轮数，工具说明要求：几个网址一次放进 `urls` 并行读；通常挑 2～3 个最相关的结果，信息够了就停；
 需要搜索加读好几页的查询优先交给后台子代理（需开启 `planner_subagent` 和 `advanced_sub_agent`）。

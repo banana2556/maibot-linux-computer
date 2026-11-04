@@ -45,7 +45,7 @@ PAGE_SCRIPT = """(() => {
 # 验证或拦截页的标题/短正文特征；长文章里提到 captcha 不算
 BLOCKED_PAGE = re.compile(r"just a moment|attention required|access denied|verify you are human|checking your browser|"
                           r"captcha|are you a robot|unusual traffic|請稍候|人机验证|人機驗證|安全验证|安全驗證", re.I)
-# plugin.py 按这句话认出读取失败，自动把 linux_desktop 载入 Planner
+# 读不到正文时提示改用一直可见的 linux_desktop 看实际画面
 READ_FALLBACK = "有網頁讀取失敗或被阻擋：改用 linux_desktop 開啟這些網址看實際畫面。"
 OUTPUT_LIMIT = 20000
 BUTTONS = {"left": 1, "middle": 2, "right": 3}

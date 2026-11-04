@@ -37,8 +37,8 @@ SUBAGENT_PREFERENCE = (
 # 主程序 deferred tools 提示（runtime.build_deferred_tools_reminder）的开头和每行「N. 名称: 描述」
 DEFERRED_REMINDER = "以下工具当前未直接暴露给你"
 DEFERRED_LINE = re.compile(r"^\d+\. ([^\s:]+)", re.M)
-# guest.py 的 READ_FALLBACK：linux_read_page 读取失败或被拦截时结果里带这句，看到就直接载入 linux_desktop
-READ_FALLBACK_MARK = "改用 linux_desktop 開啟這些網址"
+# 操作超时返回 running 时的说明；hook 看到它就直接载入 deferred 的 linux_poll（连同整组 linux 工具）
+RUNNING_MESSAGE = "操作仍在執行，用 linux_poll 繼續等待；沒有重複執行。"
 # 主程序 tool_search 结果里命中的每行「- 名称（本次新发现）」
 SEARCH_HIT = re.compile(r"^- ([^\s（]+)", re.M)
 # ponytail: 整个替换主程序 tool_search 的说明和参数；主程序以后给它加参数时要跟着改
@@ -154,7 +154,7 @@ def apply_tool_catalog(
 
     loaded：本会话已载入的工具（名称→定义，按载入顺序）；pool：本会话见过的 deferred 工具名。两者都原地更新、只追加。
     schemas：插件工具的完整定义，用来整组载入；主程序自带的工具拿不到定义，只能靠搜索载入。
-    wanted：不经搜索直接整组载入的工具，例如网页读取失败后的 linux_desktop。
+    wanted：不经搜索直接整组载入的工具，例如操作返回 running 后的 linux_poll。
     """
     reminder = next((index for index, item in enumerate(items) if item.get("item_type") == "UserMessageItem"
                      and any(DEFERRED_REMINDER in part.get("text", "") for part in item.get("parts", []))), None)
@@ -377,7 +377,7 @@ class LinuxComputerPlugin(MaiBotPlugin):
         "用於：執行指令、跑程式或腳本、安裝軟體、下載檔案、查看檔案、終端機（terminal, command, install, download）。",
         parameters={"type": "object", "properties": {"command": {"type": "string"}, "timeout": TIMEOUT_SCHEMA},
                     "required": ["command"], "additionalProperties": False},
-        visibility="visible",
+        visibility="deferred",
         timeout_ms=TOOL_RPC_TIMEOUT_MS,
     )
     async def handle_shell(self, command: str, timeout: float = 60, stream_id: str = "", **kwargs: Any) -> Dict[str, Any]:
@@ -400,7 +400,7 @@ class LinuxComputerPlugin(MaiBotPlugin):
             "actions": {"type": "array", "items": {"oneOf": action_schemas()}, "minItems": 1},
             "timeout": TIMEOUT_SCHEMA,
         }, "required": ["actions"], "additionalProperties": False},
-        visibility="deferred",
+        visibility="visible",
         timeout_ms=TOOL_RPC_TIMEOUT_MS,
     )
     async def handle_desktop(
@@ -441,7 +441,7 @@ class LinuxComputerPlugin(MaiBotPlugin):
         "用於：等待、查看進度、拿結果（wait, status, progress, result）。",
         parameters={"type": "object", "properties": {"operation_id": {"type": "string"}, "timeout": TIMEOUT_SCHEMA},
                     "required": ["operation_id"], "additionalProperties": False},
-        visibility="visible",
+        visibility="deferred",
         timeout_ms=TOOL_RPC_TIMEOUT_MS,
     )
     async def handle_poll(self, operation_id: str, timeout: float = 60, stream_id: str = "", **kwargs: Any) -> Dict[str, Any]:
@@ -486,8 +486,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
         result = definitions
         if self.config.computer.tool_catalog and "tool_search" in tools:
             loaded, pool = self._tool_sessions.setdefault(str(kwargs.get("session_id") or ""), ({}, {}))
-            wanted = ["linux_desktop"] if any(item.get("item_type") == "FunctionCallOutputItem"
-                                              and READ_FALLBACK_MARK in str(item.get("output", "")) for item in items) else []
+            wanted = ["linux_poll"] if any(item.get("item_type") == "FunctionCallOutputItem"
+                                           and RUNNING_MESSAGE in str(item.get("output", "")) for item in items) else []
             discovering = any(name not in loaded and (name in pool or name in wanted) for name in [*tools, *wanted])
             items, result = apply_tool_catalog(items, definitions, loaded, pool,
                                                await self._plugin_tool_schemas() if discovering else {}, wanted)
@@ -560,7 +560,7 @@ class LinuxComputerPlugin(MaiBotPlugin):
         if not done:
             return {"success": True, "content": json.dumps(
                 {"status": "running", "operation_id": operation_id,
-                 "message": "操作仍在執行，用 linux_poll 繼續等待；沒有重複執行。"}, ensure_ascii=False)}
+                 "message": RUNNING_MESSAGE}, ensure_ascii=False)}
         result = dict(task.result())
         result["operation_id"] = operation_id
         image = result.pop("image", None)
