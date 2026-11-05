@@ -41,6 +41,9 @@
   按 `prompt` 摘出相关内容、列出要继续看的链接，只有摘要进 Planner 上下文。摘取失败时退回原文前 3000 字。
   每页多一次小模型调用，会慢几秒；超时返回 running 时，`linux_poll` 拿到的也是摘好的结果。
   原文超过上限时结果标出 `truncated`（后面还有多少字没读到）。
+  文字读取看不到图片：页面里有内文图片（不算 100px 以下的图示）时，结果标出 `images`（几张图，要看图用桌面截图）。
+- 要对网页给感想、评论或看图时，工具说明引导直接用 `linux_desktop`：`open` 后 `read` 读全文、`observe` 看画面；
+  `linux_read_page` 的 800 字摘要是用来查事实的，不适合当感想的素材。
 - 同一聊天 15 分钟内（同 WebFetch 的缓存时间）每个网址只能用 `linux_read_page` 读一次：重读直接拒绝、不开浏览器，
   结果说明重读不会多出内容，要更多就用 `linux_desktop` 的 `open` 加 `read`，要往下卷才载入的内容先 `scroll` 或 `observe` 看画面。
   一批里混着读过和没读过的网址时，只读没读过的，读过的列在 `skipped`。避免 Planner 换个问法反复读同一页，该看画面时却不用桌面。
@@ -78,6 +81,17 @@
 第一次用电脑时在同一轮也用 `reply` 简短说一句在看什么（例如「我看一下」），查完再正式回复，中间不回报进度。
 漏了的话（有人说话后，麦麦没回应就先调用了 linux 工具），同一个 hook 在最近一次工具结果后补一条提醒：
 已经能回答就直接正式回复，还要继续查就先简短回一句、和下一步同一轮发出。麦麦一说话就不再提醒。
+
+## 交给 Replyer（`reply_handoff`，默认开启）
+
+麦麦的回复由 Replyer 另外生成，它只收到真实聊天消息和 Planner 填的 `reply_reference`，看不到工具结果和截图
+（`attach_pic` 附图时也只收到「工具返回媒体…」这句说明）。所以：
+
+- 系统提示词末尾要求 Planner 用 `reply` 时，把用电脑读到的具体内容（名称、日期、数字、重点）写进 `reply_reference`。
+- 插件挂在 `maisaka.replyer.before_model_request`：Replyer 这次选中的模型有视觉（`visual = true`）时，
+  把 Planner 上次说话后工具返回的截图（最新 3 张）加进 Replyer 请求，放在 `reply_reference` 前面，
+  并说明这是麦麦自己截的画面、不是对方传的。Replyer 模型没视觉时不加。
+  截图取自 Planner 最近一次请求，所以和 Planner 决定回复时看到的一致；麦麦说过话后就换成新的一批。
 
 麦麦上次说话后在桌面上操作过（点击、输入、按键、滚动、截图等；只用 `open`、`read`、`elements` 读网页不算）时
 （`desktop_reply_screenshot`，默认开启），同一个 hook 在那批工具结果和截图之后插入提醒：回复时一定要附上最新截图。
@@ -124,6 +138,7 @@ advanced_sub_agent = true
 | `computer.screenshot_max_edge` | 截图最长边，越小越省 token |
 | `computer.max_tabs` | 麦麦打开的网页标签页上限，默认 5，0 为不限制 |
 | `computer.brief_reply_first` | 有人说话后要用电脑时，要求先简短回一句再查，查完再正式回复；默认开启 |
+| `computer.reply_handoff` | 要求 Planner 把读到的内容写进 `reply_reference`；Replyer 有视觉时把最新 3 张截图一起交给它；默认开启 |
 | `computer.desktop_reply_screenshot` | 上次说话后在桌面上操作过时，要求回复附上最新截图，默认开启 |
 | `computer.extract_task` | `linux_read_page` 按 `prompt` 摘取网页用的模型任务（`model_config` 里的任务名），默认 `utils`，建议用快的小模型 |
 | `computer.prefer_subagent` | 在 Planner 系统提示词末尾要求查资料（搜索、读网页、比对信息）尽量交给子代理，派出后等它回报、不自己重做；只有打开单个链接这种一步完成的事自己做；默认开启，主程序没开 `planner_subagent` 时不生效 |

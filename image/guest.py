@@ -40,7 +40,10 @@ PAGE_SCRIPT = """(() => {
     if (links.length >= MAX_LINKS) break;
   }
   const status = (performance.getEntriesByType('navigation')[0] || {}).responseStatus || 0;
-  return {url: location.href, title: document.title, text: document.body ? document.body.innerText : '', links, status};
+  // 内文里的图片张数（不算 100px 以下的图示），文字读取看不到图，让模型知道要不要截图看
+  const images = [...document.images].filter(i => Math.max(i.width, i.naturalWidth) >= 100
+    && Math.max(i.height, i.naturalHeight) >= 100).length;
+  return {url: location.href, title: document.title, text: document.body ? document.body.innerText : '', links, images, status};
 })()"""
 # 验证或拦截页的标题/短正文特征；长文章里提到 captcha 不算
 BLOCKED_PAGE = re.compile(r"just a moment|attention required|access denied|verify you are human|checking your browser|"

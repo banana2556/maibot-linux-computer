@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from plugin import (BRIEF_REPLY_FIRST, RUNNING_MESSAGE, LinuxComputerPlugin, add_brief_reply_reminder,  # noqa: E402
-                    add_link_reminder, add_screenshot_reminder, apply_tool_catalog)
+                    add_link_reminder, add_screenshot_reminder, apply_tool_catalog, recent_tool_images)
 
 NAME = "maibot-linux-computer-selftest"
 
@@ -80,6 +80,44 @@ def check_brief_reply_reminder() -> None:
     assert add_brief_reply_reminder([*items, *reply]) is None
     assert add_brief_reply_reminder([said, *read]) is None
     assert add_brief_reply_reminder([said, asked]) is None
+
+
+async def check_replyer_images() -> None:
+    """Replyer 截图：Planner 上次说话后工具返回的图片（最新 3 张）放在 reply_reference 前面；模型没视觉就不加。"""
+
+    def item(item_id: str, *parts: dict) -> dict:
+        return {"item_type": "UserMessageItem", "meta": {"item_id": item_id, "logical_turn_id": None,
+                                                         "timestamp": "2026-11-05T12:00:00"}, "parts": list(parts)}
+
+    def text(value: str) -> dict:
+        return {"type": "text", "text": value}
+
+    def image(name: str) -> dict:
+        return {"type": "image", "image_format": "jpeg", "image_base64": name}
+
+    def media(item_id: str) -> dict:
+        return item(item_id, text(f'<tool_result_media msg_id="tool_result:{item_id}:1" />'), image(item_id))
+
+    said = item("self", text('<message msg_id="1" time="12:00:00" user="麦麦" is_self_message="true">\n我看一下'))
+    chat = item("chat", text('<message msg_id="2" time="12:00:01" user="小明">\n你看这张'), image("chat"))
+    planner = [media("old"), said, chat, *(media(f"s{n}") for n in range(4))]
+    assert [part["image_base64"] for part in recent_tool_images(planner)] == ["s1", "s2", "s3"]
+    assert recent_tool_images([*planner, said]) == []
+
+    system = {"item_type": "SystemMessageItem", "meta": {"item_id": "sys", "logical_turn_id": None,
+                                                         "timestamp": "2026-11-05T12:00:00"}, "parts": [text("system")]}
+    replyer = [system, chat, item("ref", text("公告重點：11 月 19 日主線第六章")), item("final", text("請回覆"))]
+    plugin = LinuxComputerPlugin()
+    plugin.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"}, "computer": {}})
+    tools = [{"type": "function", "function": {"name": "reply"}}]
+    await plugin.handle_planner_request(items=[system, *planner], tool_definitions=tools, session_id="s")
+    args = {"items": replyer, "session_id": "s", "reply_tool_args": {"reply_reference": "公告重點：11 月 19 日主線第六章"}}
+    hooked = await plugin.handle_replyer_request(**args, selected_model_visual=True)
+    items = hooked["modified_kwargs"]["items"]
+    assert [i["meta"]["item_id"] for i in items] == ["sys", "chat", "replyer-screens-ref", "ref", "final"], items
+    assert [part.get("image_base64") for part in items[2]["parts"][1:]] == ["s1", "s2", "s3"], items[2]
+    assert await plugin.handle_replyer_request(**args, selected_model_visual=False) is None
+    assert await plugin.handle_replyer_request(**{**args, "session_id": "other"}, selected_model_visual=True) is None
 
 
 def check_screenshot_reminder() -> None:
@@ -200,6 +238,7 @@ async def check_tool_catalog() -> None:
 async def main() -> None:
     check_link_reminder()
     check_brief_reply_reminder()
+    await check_replyer_images()
     check_screenshot_reminder()
     await check_tool_catalog()
     plugin = LinuxComputerPlugin()
@@ -257,6 +296,8 @@ async def main() -> None:
         await plugin.handle_shell("mkdir -p /tmp/www && echo '<title>Just a moment...</title>' > /tmp/www/block.html && "
                                   "echo '<a href=\"/block.html\" style=\"font-size:40px\">go</a>' > /tmp/www/link.html && "
                                   "python3 -c \"print('<p>' + 'word ' * 30000)\" > /tmp/www/long.html && "
+                                  "echo '<p>公告</p><img src=\"/a.png\" width=\"300\" height=\"200\"><img src=\"/i.png\" "
+                                  "width=\"16\" height=\"16\">' > /tmp/www/pic.html && "
                                   "(setsid python3 -m http.server 8765 --bind 127.0.0.1 --directory /tmp/www "
                                   ">/dev/null 2>&1 &) && sleep 1", stream_id="owner")
         local = await plugin.handle_desktop([{"action": "open", "path": "http://127.0.0.1:8765/link.html"},
@@ -312,6 +353,10 @@ async def main() -> None:
         long = await plugin.handle_read_page(["http://127.0.0.1:8765/long.html"], prompt="x", stream_id="owner")
         long_page = json.loads(long["content"])["results"][0]["result"]["pages"][0]
         assert "沒有讀到" in long_page["truncated"] and "後面還有" in asked[-1], long_page
+        # 文字读取看不到图：标出内文图片张数（16px 的图示不算），引导用桌面截图看
+        pic = await plugin.handle_read_page(["http://127.0.0.1:8765/pic.html"], prompt="x", stream_id="owner")
+        pic_page = json.loads(pic["content"])["results"][0]["result"]["pages"][0]
+        assert pic_page["images"].startswith("這頁有 1 張圖片") and "observe" in pic_page["images"], pic_page
         # 一次并行读多个：打不开的只在自己那一项报错；读过的网址跳过并说明
         mixed = await plugin.handle_read_page(["https://example.com", "https://example.com/?mixed",
                                                "https://nonexistent.invalid"], prompt="x", stream_id="owner")

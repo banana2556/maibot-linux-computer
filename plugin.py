@@ -39,6 +39,12 @@ BRIEF_REPLY_FIRST = (
     "\n\n用 linux_read_page、linux_desktop 這些 Linux 電腦工具查東西要花一段時間：有人問了之後你還沒回過話，"
     "第一次呼叫時在同一輪也用 reply 簡短說一句你在看什麼（例如「我看一下」），查完再正式回覆，中間不用回報進度。"
 )
+# Replyer 只收到真实聊天消息和 reply_reference：工具的文字结果要 Planner 写进 reply_reference，
+# 截图由插件在 Replyer 请求前直接加进去（Replyer 模型有视觉时）
+REPLY_HANDOFF = ("\n\n用 reply 時把用電腦讀到的具體內容（名稱、日期、數字、重點）寫進 reply_reference，"
+                 "Replyer 看不到工具的文字結果；你截過的畫面會一起交給 Replyer 看。")
+REPLYER_SCREENS = 3  # 交给 Replyer 的截图最多几张，取最新的
+REPLYER_SCREENS_NOTE = "以下是你剛才在 Linux 電腦上看到的畫面（越後面越新），回覆時可以依畫面內容說；這些是你自己截的圖，不是對方傳來的。"
 # 主程序 deferred tools 提示（runtime.build_deferred_tools_reminder）的开头和每行「N. 名称: 描述」
 DEFERRED_REMINDER = "以下工具当前未直接暴露给你"
 DEFERRED_LINE = re.compile(r"^\d+\. ([^\s:]+)", re.M)
@@ -271,6 +277,35 @@ def _after_tool_results(items: List[Dict[str, Any]], index: int) -> int:
     return index
 
 
+def recent_tool_images(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """麦麦上次说话后工具返回的图片（最新的 REPLYER_SCREENS 张），也就是 Planner 这次回复前看过的画面。
+
+    Planner 看不了图时主程序已把图片换成文字描述，这里就是空的。
+    """
+    spoke = max((index for index, item in enumerate(items) if _is_own_message(item)), default=-1)
+    images = [part for item in items[spoke + 1:] if item.get("item_type") == "UserMessageItem" and item.get("parts")
+              and str(item["parts"][0].get("text", "")).startswith("<tool_result_media")
+              for part in item["parts"] if part.get("type") == "image" and part.get("image_base64")]
+    return images[-REPLYER_SCREENS:]
+
+
+def add_replyer_images(
+    items: List[Dict[str, Any]], images: List[Dict[str, Any]], reference: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """把截图加进 Replyer 请求，放在 reply_reference 那条前面（找不到就放在最后一条 user 消息前面）；否则返回 None。"""
+    users = [index for index, item in enumerate(items) if item.get("item_type") == "UserMessageItem"]
+    if not images or not users:
+        return None
+    anchor = next((index for index in users if reference.strip() and "".join(
+        part.get("text", "") for part in items[index].get("parts", [])).strip() == reference.strip()), users[-1])
+    meta = items[anchor]["meta"]
+    screens = {"item_type": "UserMessageItem",
+               "meta": {"item_id": f"replyer-screens-{meta['item_id']}", "logical_turn_id": None,
+                        "timestamp": meta["timestamp"]},
+               "parts": [{"type": "text", "text": REPLYER_SCREENS_NOTE}, *images]}
+    return [*items[:anchor], screens, *items[anchor:]]
+
+
 def _is_chat_message(item: Dict[str, Any]) -> bool:
     """别人在聊天里说的话。"""
     texts = [part["text"] for part in item.get("parts", []) if part.get("type") == "text"]
@@ -377,6 +412,9 @@ class ComputerSectionConfig(PluginConfigBase):
     brief_reply_first: bool = Field(
         default=True, description="有人说话后麦麦要用电脑（读网页、操作桌面）时，要求先简短回一句（例如「我看一下」），"
         "查完再正式回复；中途不定时回报进度")
+    reply_handoff: bool = Field(
+        default=True, description="要求 Planner 用 reply 时把读到的内容写进 reply_reference（Replyer 看不到工具结果）；"
+        "Replyer 模型有视觉时，把 Planner 上次说话后截的画面（最新 3 张）一起交给 Replyer")
     desktop_reply_screenshot: bool = Field(
         default=True, description="上次说话后在桌面上操作过（点击、输入、截图等）时，要求麦麦回复时附上最新的截图")
     extract_task: str = Field(
@@ -412,6 +450,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
         self._warmup: Optional[asyncio.Task] = None
         # session_id → (已载入的工具, 见过的 deferred 工具)，见 apply_tool_catalog
         self._tool_sessions: Dict[str, tuple] = {}
+        # session_id → Planner 最近一次请求里、上次说话后看过的截图，Replyer 请求时加进去
+        self._screens: Dict[str, List[Dict[str, Any]]] = {}
 
     async def on_load(self) -> None:
         """启用时预先构建镜像并启动容器，首次构建需要几分钟。"""
@@ -446,8 +486,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
 
     @Tool(
         "linux_desktop",
-        description="在 Linux 沙盒電腦的圖形桌面上依序執行 actions。需要看畫面、點擊、輸入、登入、讀網頁完整原文，"
-        "或 linux_read_page 讀取失敗、被阻擋時用它；只想知道網頁裡的某件事用 linux_read_page。"
+        description="在 Linux 沙盒電腦的圖形桌面上依序執行 actions。需要看畫面或圖片、對網頁給感想或評論（open 後 read 讀全文、"
+        "observe 看畫面）、點擊、輸入、登入，或 linux_read_page 讀取失敗、被阻擋時用它；只想查網頁裡的某件事用 linux_read_page。"
         "批次裡有 observe 才回傳截圖；看不到圖時用 elements 取得可以點的元素和座標。"
         "逾時回傳 running，用 linux_poll 等待，不要重複操作。",
         parameters={"type": "object", "properties": {
@@ -473,7 +513,7 @@ class LinuxComputerPlugin(MaiBotPlugin):
         "搜尋時讀 https://html.duckduckgo.com/html/?q=關鍵字（Google 會攔截自動存取），prompt 寫要找什麼，"
         "例如「列出 FFXIV 7.4 官方更新說明的連結」；摘要不夠再挑 2～3 個結果一次讀，資訊足夠回答就停。"
         "需要搜尋加讀好幾頁的資料查詢，優先交給 subagent 並授權本工具，你繼續聊天。"
-        "同一網址只能讀一次；要更多內容、完整原文、看畫面、點擊、登入，或讀取失敗、被阻擋時改用 linux_desktop。",
+        "同一網址只能讀一次；要對網頁給感想或評論、看圖、更多內容、完整原文、點擊、登入，或讀取失敗、被阻擋時改用 linux_desktop。",
         parameters={"type": "object", "properties": {
             "urls": URLS_SCHEMA,
             "prompt": {"type": "string", "description": "想從這些網頁知道什麼，例如「7.4 版有哪些新內容」；只會回傳和它相關的部分"},
@@ -521,6 +561,8 @@ class LinuxComputerPlugin(MaiBotPlugin):
     async def _extract_page(self, page: Dict[str, Any], prompt: str) -> Dict[str, Any]:
         brief = {key: page[key] for key in ("url", "title", "note", "truncated", "error", "problem")
                  if key in page}
+        if page.get("images"):
+            brief["images"] = f"這頁有 {page['images']} 張圖片，摘要不包含圖片內容；要看圖用 linux_desktop open 後 observe。"
         if "error" in page or "problem" in page:
             return brief
         links = "\n".join(f"- {link['text']}：{link['url']}" for link in page.get("links", [])) or "（沒有）"
@@ -574,8 +616,19 @@ class LinuxComputerPlugin(MaiBotPlugin):
 
     # ===== Hook =====
 
+    @HookHandler("maisaka.replyer.before_model_request",
+                 description="Replyer 模型有视觉时，把 Planner 上次说话后在电脑上截的画面一起交给 Replyer")
+    async def handle_replyer_request(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        """Replyer 只收到真实聊天消息，看不到工具返回的截图；这里补上 Planner 回复前看过的最新几张。"""
+        if not self.config.computer.reply_handoff or not kwargs.get("selected_model_visual"):
+            return None
+        reference = str((kwargs.get("reply_tool_args") or {}).get("reply_reference") or "")
+        items = add_replyer_images(kwargs.get("items") or [], self._screens.get(str(kwargs.get("session_id") or ""), []),
+                                   reference)
+        return None if items is None else {"action": "continue", "modified_kwargs": {"items": items}}
+
     @HookHandler("maisaka.planner.before_request",
-                 description="提醒 Planner 打开聊天里的链接、长时间操作电脑时先说一下进展，可要求查资料交给子代理，接管 deferred tools")
+                 description="提醒 Planner 打开聊天里的链接、用电脑前先简短回一句，可要求查资料交给子代理，接管 deferred tools")
     async def handle_planner_request(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
         """提醒都插在对应内容之后，不放进请求末尾的工具提示里。
 
@@ -590,6 +643,9 @@ class LinuxComputerPlugin(MaiBotPlugin):
             if self.config.computer.brief_reply_first:
                 items = append_to_system(items, BRIEF_REPLY_FIRST)
                 items = add_brief_reply_reminder(items) or items
+            if self.config.computer.reply_handoff:
+                items = append_to_system(items, REPLY_HANDOFF)
+                self._screens[str(kwargs.get("session_id") or "")] = recent_tool_images(original)
             if self.config.computer.desktop_reply_screenshot:
                 items = add_screenshot_reminder(items) or items
         if self.config.computer.prefer_subagent and "subagent" in tools:
