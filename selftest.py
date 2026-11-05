@@ -3,7 +3,6 @@
 需要本机可用的 docker；在 MaiBot 根目录运行：uv run python plugins/linux_computer/selftest.py
 """
 
-from datetime import datetime
 from pathlib import Path
 
 import asyncio
@@ -12,8 +11,8 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from plugin import (RUNNING_MESSAGE, LinuxComputerPlugin, add_link_reminder, add_progress_reminder,  # noqa: E402
-                    add_screenshot_reminder, apply_tool_catalog)
+from plugin import (BRIEF_REPLY_FIRST, RUNNING_MESSAGE, LinuxComputerPlugin, add_brief_reply_reminder,  # noqa: E402
+                    add_link_reminder, add_screenshot_reminder, apply_tool_catalog)
 
 NAME = "maibot-linux-computer-selftest"
 
@@ -50,34 +49,37 @@ def check_link_reminder() -> None:
     assert add_link_reminder(items[:1] + items[2:]) is None
 
 
-def check_progress_reminder() -> None:
-    """进度提醒：上次说话后连续操作超过阈值才提醒，插在最近的工具结果和截图之后。"""
+def check_brief_reply_reminder() -> None:
+    """先回一句：有人说话后麦麦没回应就用电脑才提醒，插在最近的工具结果和截图之后；回过话或同一轮回覆就不提醒。"""
 
-    def item(kind: str, item_id: str, second: int, **fields: object) -> dict:
+    def item(kind: str, item_id: str, **fields: object) -> dict:
         return {"item_type": kind, "meta": {"item_id": item_id, "logical_turn_id": "t" if "Function" in kind else None,
-                                            "timestamp": f"2026-11-02T12:00:{second:02d}"}, **fields}
+                                            "timestamp": "2026-11-05T12:00:00"}, **fields}
 
-    def call(item_id: str, second: int, name: str) -> list:
-        return [item("FunctionCallItem", item_id, second, tool_call={"call_id": item_id, "func_name": name, "args": {},
-                                                                      "extra_content": None}),
-                item("FunctionCallOutputItem", f"{item_id}-out", second, call_id=item_id, output="ok", success=True,
-                     tool_name=name)]
+    def text(item_id: str, value: str) -> dict:
+        return item("UserMessageItem", item_id, parts=[{"type": "text", "text": value}])
 
-    items = [
-        item("UserMessageItem", "self", 0, parts=[{"type": "text", "text":
-             '<message msg_id="1" time="12:00:00" user="麦麦" is_self_message="true">\n好，我去弄'}]),
-        *call("a", 1, "linux_shell"), *call("b", 2, "linux_desktop"),
-        item("UserMessageItem", "shot", 2, parts=[{"type": "text", "text": "[图片]"},
-                                                  {"type": "image", "image_format": "jpeg", "image_base64": ""}]),
-        item("UserMessageItem", "tail", 3, parts=[{"type": "text", "text": "<system-reminder>tool_search</system-reminder>"}]),
-    ]
-    late = datetime.fromisoformat("2026-11-02T12:01:30")
-    result = add_progress_reminder(items, 60, now=late)
-    assert [i["meta"]["item_id"] for i in result][-2:] == ["progress-reminder-shot", "tail"], result
-    assert "2 步" in result[-2]["parts"][0]["text"], result[-2]
-    assert add_progress_reminder(items, 60, now=datetime.fromisoformat("2026-11-02T12:00:30")) is None
-    assert add_progress_reminder(items, 0, now=late) is None
-    assert add_progress_reminder([*items, *call("r", 4, "reply")], 60, now=late) is None
+    def call(item_id: str, name: str) -> list:
+        return [item("FunctionCallItem", item_id, tool_call={"call_id": item_id, "func_name": name, "args": {},
+                                                             "extra_content": None}),
+                item("FunctionCallOutputItem", f"{item_id}-out", call_id=item_id, output="ok", success=True, tool_name=name)]
+
+    said = text("self", '<message msg_id="1" time="12:00:00" user="麦麦" is_self_message="true">\n好')
+    asked = text("ask", '<message msg_id="2" time="12:00:01" user="小明">\n看一下这篇公告 https://x.notion.site/a')
+    shot = item("UserMessageItem", "shot", parts=[{"type": "image", "image_format": "jpeg", "image_base64": ""}])
+    tail = text("tail", "<system-reminder>tool_search</system-reminder>")
+    # 问了之后没回话就读网页、开桌面：提醒放在最后的结果和截图之后
+    items = [said, asked, *call("a", "linux_read_page"), *call("b", "linux_desktop"), shot, tail]
+    result = add_brief_reply_reminder(items)
+    assert [i["meta"]["item_id"] for i in result][-2:] == ["brief-reply-reminder-shot", "tail"], result
+    assert "簡短說一句" in result[-2]["parts"][0]["text"], result[-2]
+    # 同一轮 reply 和读网页一起发、先回了再查、回覆之后、没人说话、还没用电脑：都不提醒
+    reply, read = call("r", "reply"), call("a", "linux_read_page")
+    assert add_brief_reply_reminder([said, asked, reply[0], read[0], reply[1], read[1]]) is None
+    assert add_brief_reply_reminder([said, asked, *reply, *read]) is None
+    assert add_brief_reply_reminder([*items, *reply]) is None
+    assert add_brief_reply_reminder([said, *read]) is None
+    assert add_brief_reply_reminder([said, asked]) is None
 
 
 def check_screenshot_reminder() -> None:
@@ -191,11 +193,13 @@ async def check_tool_catalog() -> None:
         tool_definitions=[tool("reply"), tool("tool_search"), tool("linux_read_page"), tool("linux_desktop")])
     assert names(hooked["modified_kwargs"]["tool_definitions"]) == [
         "reply", "tool_search", "linux_read_page", "linux_desktop", "linux_shell", "linux_poll", "linux_cancel"], hooked
+    # 有 reply 的 Planner 请求：系统提示词末尾要求第一次用电脑时同一轮先简短回一句
+    assert BRIEF_REPLY_FIRST in hooked["modified_kwargs"]["items"][0]["parts"][-1]["text"], hooked
 
 
 async def main() -> None:
     check_link_reminder()
-    check_progress_reminder()
+    check_brief_reply_reminder()
     check_screenshot_reminder()
     await check_tool_catalog()
     plugin = LinuxComputerPlugin()
@@ -207,7 +211,11 @@ async def main() -> None:
     tools = [{"type": "function", "function": {"name": name}} for name in ("reply", "subagent")]
     hooked = await plugin.handle_planner_request(items=system, tool_definitions=tools)
     assert "subagent" in hooked["modified_kwargs"]["items"][0]["parts"][0]["text"], hooked
-    assert await plugin.handle_planner_request(items=system, tool_definitions=tools[:1]) is None
+    only_reply = await plugin.handle_planner_request(items=system, tool_definitions=tools[:1])
+    prompt = only_reply["modified_kwargs"]["items"][0]["parts"][0]["text"]
+    assert BRIEF_REPLY_FIRST in prompt and "subagent" not in prompt, prompt
+    reader = [{"type": "function", "function": {"name": "linux_read_page"}}]  # 子代理自己的请求：不动
+    assert await plugin.handle_planner_request(items=system, tool_definitions=reader) is None
     try:
         denied = await plugin.handle_shell("id", stream_id="group")
         assert not denied["success"] and "權限" in denied["error"], denied

@@ -4,7 +4,6 @@
 每次工具调用通过 docker exec 运行容器内的 guest.py，超时未完成的操作可用 linux_poll 继续等待。
 """
 
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Dict, List, Optional
 from uuid import uuid4
@@ -34,6 +33,11 @@ SUBAGENT_PREFERENCE = (
     "\n\n查資料（搜尋、讀網頁、比對資訊）時，盡量交給 subagent 去做，並授權它需要的工具；"
     "派出時可以在同一輪用一句話告訴對方你在查，之後等它回報，不要自己再查同一件事。"
     "只有開啟聊天裡的單一連結這種一步就能完成的事，才自己直接做。"
+)
+# 系统提示词里的固定要求：第一次用电脑时就在同一轮简短回一句；漏了由 add_brief_reply_reminder 补提醒
+BRIEF_REPLY_FIRST = (
+    "\n\n用 linux_read_page、linux_desktop 這些 Linux 電腦工具查東西要花一段時間：有人問了之後你還沒回過話，"
+    "第一次呼叫時在同一輪也用 reply 簡短說一句你在看什麼（例如「我看一下」），查完再正式回覆，中間不用回報進度。"
 )
 # 主程序 deferred tools 提示（runtime.build_deferred_tools_reminder）的开头和每行「N. 名称: 描述」
 DEFERRED_REMINDER = "以下工具当前未直接暴露给你"
@@ -96,33 +100,26 @@ def add_link_reminder(items: List[Dict[str, Any]]) -> Optional[List[Dict[str, An
     return [*items[:anchor + 1], reminder, *items[anchor + 1:]]
 
 
-def add_progress_reminder(
-    items: List[Dict[str, Any]], seconds: int, now: Optional[datetime] = None,
-) -> Optional[List[Dict[str, Any]]]:
-    """麦麦上次在聊天里说话之后，已经连续操作电脑超过 seconds 秒时，提醒先说一下进展再继续；否则返回 None。
+def add_brief_reply_reminder(items: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """有人说话后，麦麦还没回应就开始用电脑时，提醒先简短回一句再继续；否则返回 None。
 
-    提醒插在最近一次工具结果（及其截图）之后。说话后计时重新开始，所以长任务里大约每 seconds 秒提醒一次。
+    读网页、操作画面要花一段时间，对方不知道麦麦在做事。先回了「我看一下」再用电脑、或和电脑操作同一轮回覆的不提醒；
+    麦麦一说话就不再提醒，中途也不定时回报。提醒插在最近一次工具结果（及其截图）之后。
     """
-    if seconds <= 0:
-        return None
     spoke = max((index for index, item in enumerate(items) if _is_own_message(item)), default=-1)
-    calls = [item for item in items[spoke + 1:] if item.get("item_type") == "FunctionCallItem"
-             and item["tool_call"]["func_name"].startswith("linux_")]
-    if not calls:
+    first = next((index for index, item in enumerate(items) if index > spoke and item.get("item_type") == "FunctionCallItem"
+                  and item["tool_call"]["func_name"].startswith("linux_")), None)
+    outputs = [index for index, item in enumerate(items) if item.get("item_type") == "FunctionCallOutputItem"]
+    if first is None or not outputs or not any(_is_chat_message(item) for item in items[spoke + 1:first]):
         return None
-    started = datetime.fromisoformat(calls[0]["meta"]["timestamp"])
-    if ((now or datetime.now(started.tzinfo)) - started).total_seconds() < seconds:
-        return None
-    end = _after_tool_results(items, max(
-        index for index, item in enumerate(items) if item.get("item_type") == "FunctionCallOutputItem"))
+    end = _after_tool_results(items, outputs[-1])
     reminder = {
         "item_type": "UserMessageItem",
-        "meta": {"item_id": f"progress-reminder-{items[end]['meta']['item_id']}", "logical_turn_id": None,
+        "meta": {"item_id": f"brief-reply-reminder-{items[end]['meta']['item_id']}", "logical_turn_id": None,
                  "timestamp": items[end]["meta"]["timestamp"]},
-        "parts": [{"type": "text", "text": f"<system-reminder>\n你已經在電腦上連續操作了 {len(calls)} 步，"
-                   "這段時間對方沒收到你的任何訊息，不知道進度。用一兩句話告訴對方你在做什麼、做到哪一步，"
-                   "畫面有參考價值時可以 observe 截圖附上；這句話和下一步操作放在同一輪一起發出，不要為此單獨佔一輪。"
-                   "\n</system-reminder>"}],
+        "parts": [{"type": "text", "text": "<system-reminder>\n對方還沒收到你任何回應，你就開始用電腦了。"
+                   "已經能回答就直接正式回覆；還要繼續查，就先用 reply 簡短說一句你在看什麼（例如「我看一下公告」），"
+                   "和下一步操作放在同一輪發出，查完再正式回覆，中間不用回報進度。\n</system-reminder>"}],
     }
     return [*items[:end + 1], reminder, *items[end + 1:]]
 
@@ -274,6 +271,12 @@ def _after_tool_results(items: List[Dict[str, Any]], index: int) -> int:
     return index
 
 
+def _is_chat_message(item: Dict[str, Any]) -> bool:
+    """别人在聊天里说的话。"""
+    texts = [part["text"] for part in item.get("parts", []) if part.get("type") == "text"]
+    return item.get("item_type") == "UserMessageItem" and bool(texts) and bool(CHAT_HEADER.match(texts[0]))
+
+
 def _is_own_message(item: Dict[str, Any]) -> bool:
     """麦麦在聊天里说过的话：reply 调用，或历史里带 is_self_message 的消息。"""
     if item.get("item_type") == "FunctionCallItem":
@@ -371,8 +374,9 @@ class ComputerSectionConfig(PluginConfigBase):
     screen: str = Field(default="1280x800", description="虚拟屏幕分辨率；删除容器重建后生效")
     screenshot_max_edge: int = Field(default=1280, description="截图最长边（像素），0 为原始分辨率；坐标始终按返回的截图计算")
     max_tabs: int = Field(default=5, description="麦麦用 open 打开的网页标签页最多保留几个，超出时自动关闭最早的；0 为不限制")
-    progress_reminder_seconds: int = Field(
-        default=60, description="连续操作电脑超过这么多秒、期间没在聊天里说过话时，提醒麦麦先说一下进展；0 为关闭")
+    brief_reply_first: bool = Field(
+        default=True, description="有人说话后麦麦要用电脑（读网页、操作桌面）时，要求先简短回一句（例如「我看一下」），"
+        "查完再正式回复；中途不定时回报进度")
     desktop_reply_screenshot: bool = Field(
         default=True, description="上次说话后在桌面上操作过（点击、输入、截图等）时，要求麦麦回复时附上最新的截图")
     extract_task: str = Field(
@@ -575,7 +579,7 @@ class LinuxComputerPlugin(MaiBotPlugin):
     async def handle_planner_request(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
         """提醒都插在对应内容之后，不放进请求末尾的工具提示里。
 
-        子代理的请求也经过这个 hook：它没有 reply、subagent 和 tool_search，所以不会收到进度提醒、子代理要求，
+        子代理的请求也经过这个 hook：它没有 reply、subagent 和 tool_search，所以不会收到先回一句的提醒、子代理要求，
         工具也不被接管。
         """
         original = kwargs.get("items") or []
@@ -583,7 +587,9 @@ class LinuxComputerPlugin(MaiBotPlugin):
         tools = {tool_name(definition) for definition in definitions}
         items = add_link_reminder(original) or original
         if "reply" in tools:
-            items = add_progress_reminder(items, self.config.computer.progress_reminder_seconds) or items
+            if self.config.computer.brief_reply_first:
+                items = append_to_system(items, BRIEF_REPLY_FIRST)
+                items = add_brief_reply_reminder(items) or items
             if self.config.computer.desktop_reply_screenshot:
                 items = add_screenshot_reminder(items) or items
         if self.config.computer.prefer_subagent and "subagent" in tools:
