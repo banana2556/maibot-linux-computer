@@ -118,6 +118,10 @@ async def check_replyer_images() -> None:
     assert [part.get("image_base64") for part in items[2]["parts"][1:]] == ["s1", "s2", "s3"], items[2]
     assert await plugin.handle_replyer_request(**args, selected_model_visual=False) is None
     assert await plugin.handle_replyer_request(**{**args, "session_id": "other"}, selected_model_visual=True) is None
+    # Replyer 重试仍用同一批；整则回复生成完就清掉，之后不经过 Planner 的回复不会带到旧截图
+    assert await plugin.handle_replyer_request(**args, selected_model_visual=True) is not None
+    await plugin.handle_reply_done(session_id="s", response="好", reply_tool_args={})
+    assert await plugin.handle_replyer_request(**args, selected_model_visual=True) is None
 
 
 def check_screenshot_reminder() -> None:
@@ -153,6 +157,8 @@ def check_screenshot_reminder() -> None:
     assert "observe" in text(add_screenshot_reminder(clicked), "e-out")
     # 只读网页、说话之后没操作、操作在说话之前：都不提醒
     assert add_screenshot_reminder([said, *call("c", "linux_desktop", "ok", "open", "read", "elements")]) is None
+    # 只是看画面（截图、滚动、移动鼠标）也不算，看公告给感想不必把截图发回聊天
+    assert add_screenshot_reminder([said, *call("v", "linux_desktop", "ok", "open", "scroll", "move", "observe")]) is None
     assert add_screenshot_reminder([*items, *call("r", "reply")]) is None
     assert add_screenshot_reminder([*desktop("a"), said, *call("d", "linux_shell")]) is None
     # 同一轮并行调用：先是两个结果，再是截图；提醒要放在整批之后
@@ -249,7 +255,9 @@ async def main() -> None:
                "timestamp": "2026-11-02T12:00:00"}, "parts": [{"type": "text", "text": "system"}]}]
     tools = [{"type": "function", "function": {"name": name}} for name in ("reply", "subagent")]
     hooked = await plugin.handle_planner_request(items=system, tool_definitions=tools)
-    assert "subagent" in hooked["modified_kwargs"]["items"][0]["parts"][0]["text"], hooked
+    # 三条规则组合成系统提示词末尾的一段，分流只写在这里
+    rules = hooked["modified_kwargs"]["items"][0]["parts"][0]["text"]
+    assert rules.count("使用 Linux 電腦的方式") == 1 and rules.count("\n- ") == 3 and "subagent" in rules, rules
     only_reply = await plugin.handle_planner_request(items=system, tool_definitions=tools[:1])
     prompt = only_reply["modified_kwargs"]["items"][0]["parts"][0]["text"]
     assert BRIEF_REPLY_FIRST in prompt and "subagent" not in prompt, prompt

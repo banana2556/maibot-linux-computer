@@ -59,8 +59,12 @@
 对应那页带 `problem` 说明原因，结果附上改用 `linux_desktop` 打开看实际画面的提示，
 `linux_desktop` 一直可见，下一轮就能直接用。
 
-为了少跑轮数，工具说明要求：几个网址一次放进 `urls` 并行读；通常挑 2～3 个最相关的结果，信息够了就停；
-需要搜索加读好几页的查询优先交给后台子代理（需开启 `planner_subagent` 和 `advanced_sub_agent`）。
+为了少跑轮数，工具说明要求：几个网址一次放进 `urls` 并行读；通常挑 2～3 个最相关的结果，信息够了就停。
+
+每条规则只写在一个地方：工具说明只写工具之间怎么选（查事实用 `linux_read_page`，给感想、看图、操作用 `linux_desktop`）；
+自己做还是交给子代理、先回一句、交给 Replyer 这三条，按设置组合成系统提示词末尾的一段「使用 Linux 電腦的方式」，每轮内容相同。
+分流规则是：搜索、读好几个网页、比对信息交给后台子代理（需开启 `planner_subagent` 和 `advanced_sub_agent`）；
+只看一个网页（查一件事、给感想、看图）自己做，因为子代理截的图只留在子代理自己的历史里，传不到回复里。
 `linux_desktop` 的 `read` 返回的原文合计约 1.2 万字、链接 40 个，因为会整段留在 Planner 上下文里，更长的页面会截断。
 
 工具说明、提醒和返回给模型的提示都用繁体中文；WebUI 配置说明和本文档仍是简体。
@@ -91,9 +95,11 @@
 - 插件挂在 `maisaka.replyer.before_model_request`：Replyer 这次选中的模型有视觉（`visual = true`）时，
   把 Planner 上次说话后工具返回的截图（最新 3 张）加进 Replyer 请求，放在 `reply_reference` 前面，
   并说明这是麦麦自己截的画面、不是对方传的。Replyer 模型没视觉时不加。
-  截图取自 Planner 最近一次请求，所以和 Planner 决定回复时看到的一致；麦麦说过话后就换成新的一批。
+  截图取自 Planner 最近一次请求，所以和 Planner 决定回复时看到的一致；
+  一则回复生成完（`maisaka.reply.before_post_process`）就清掉，不会带到之后不经过 Planner 的回复，Replyer 重试时仍用同一批。
 
-麦麦上次说话后在桌面上操作过（点击、输入、按键、滚动、截图等；只用 `open`、`read`、`elements` 读网页不算）时
+麦麦上次说话后在桌面上操作过（点击、输入、按键、拖拽；只是 `observe` 截图、`scroll`、`move` 看画面，
+或用 `open`、`read`、`elements` 读网页都不算，看公告给感想不必把截图发回聊天）时
 （`desktop_reply_screenshot`，默认开启），同一个 hook 在那批工具结果和截图之后插入提醒：回复时一定要附上最新截图。
 操作后有截图就直接给出 `reply` 的 `attach_pic` 要填的 `media_index=tool_result:<call_id>:1`，还没有就要求先 `observe` 截一张。
 
@@ -141,7 +147,7 @@ advanced_sub_agent = true
 | `computer.reply_handoff` | 要求 Planner 把读到的内容写进 `reply_reference`；Replyer 有视觉时把最新 3 张截图一起交给它；默认开启 |
 | `computer.desktop_reply_screenshot` | 上次说话后在桌面上操作过时，要求回复附上最新截图，默认开启 |
 | `computer.extract_task` | `linux_read_page` 按 `prompt` 摘取网页用的模型任务（`model_config` 里的任务名），默认 `utils`，建议用快的小模型 |
-| `computer.prefer_subagent` | 在 Planner 系统提示词末尾要求查资料（搜索、读网页、比对信息）尽量交给子代理，派出后等它回报、不自己重做；只有打开单个链接这种一步完成的事自己做；默认开启，主程序没开 `planner_subagent` 时不生效 |
+| `computer.prefer_subagent` | 在 Planner 系统提示词末尾要求搜索、读好几个网页、比对信息时交给子代理，派出后等它回报、不自己重做；只看一个网页（查一件事、给感想、看图）自己做，因为子代理截的图传不到回复里；默认开启，主程序没开 `planner_subagent` 时不生效 |
 | `computer.tool_catalog` | 接管 Planner 的 deferred tools（类别目录、整组载入、会话内保持、顺序固定），默认开启；关闭后交回主程序原本的 `tool_search` |
 
 ## 看它在做什么 / 手动接管

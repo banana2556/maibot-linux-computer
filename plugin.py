@@ -29,28 +29,30 @@ CHAT_HEADER = re.compile(r'<message (?![^>]*is_self_message="true")[^>]*\buser="
 SELF_HEADER = re.compile(r'<message [^>]*is_self_message="true"')
 # 只提醒最近这么多条聊天消息里的链接，更早的视为已经过去的话题
 RECENT_IM_MESSAGES = 10
+# Planner 系统提示词末尾的「使用 Linux 电脑的方式」：下面三条按设置组合成一段固定内容，见 computer_rules。
+# 每条规则只写在一个地方：自己做还是交给子代理只写在这里，工具说明只写工具之间怎么选。
+# 分流：子代理截的图只留在子代理自己的历史里，Replyer 看不到，所以给感想、看图要自己做
 SUBAGENT_PREFERENCE = (
-    "\n\n查資料（搜尋、讀網頁、比對資訊）時，盡量交給 subagent 去做，並授權它需要的工具；"
-    "派出時可以在同一輪用一句話告訴對方你在查，之後等它回報，不要自己再查同一件事。"
-    "只有開啟聊天裡的單一連結這種一步就能完成的事，才自己直接做。"
+    "要搜尋、讀好幾個網頁或比對資訊時，交給 subagent 並授權它需要的工具，派出後等它回報，不要自己再查同一件事；"
+    "只看一個網頁（查一件事、給感想、看圖）自己做，subagent 截的圖傳不到你的回覆裡。"
 )
-# 系统提示词里的固定要求：第一次用电脑时就在同一轮简短回一句；漏了由 add_brief_reply_reminder 补提醒
+# 第一次用电脑时就在同一轮简短回一句；漏了由 add_brief_reply_reminder 补提醒
 BRIEF_REPLY_FIRST = (
-    "\n\n用 linux_read_page、linux_desktop 這些 Linux 電腦工具查東西要花一段時間：有人問了之後你還沒回過話，"
+    "用 linux_read_page、linux_desktop 查東西要花一段時間：有人問了之後你還沒回過話，"
     "第一次呼叫時在同一輪也用 reply 簡短說一句你在看什麼（例如「我看一下」），查完再正式回覆，中間不用回報進度。"
 )
 # Replyer 只收到真实聊天消息和 reply_reference：工具的文字结果要 Planner 写进 reply_reference，
 # 截图由插件在 Replyer 请求前直接加进去（Replyer 模型有视觉时）
-REPLY_HANDOFF = ("\n\n用 reply 時把用電腦讀到的具體內容（名稱、日期、數字、重點）寫進 reply_reference，"
+REPLY_HANDOFF = ("用 reply 時把用電腦讀到的具體內容（名稱、日期、數字、重點）寫進 reply_reference，"
                  "Replyer 看不到工具的文字結果；你截過的畫面會一起交給 Replyer 看。")
 REPLYER_SCREENS = 3  # 交给 Replyer 的截图最多几张，取最新的
 REPLYER_SCREENS_NOTE = "以下是你剛才在 Linux 電腦上看到的畫面（越後面越新），回覆時可以依畫面內容說；這些是你自己截的圖，不是對方傳來的。"
 # 主程序 deferred tools 提示（runtime.build_deferred_tools_reminder）的开头和每行「N. 名称: 描述」
 DEFERRED_REMINDER = "以下工具当前未直接暴露给你"
 DEFERRED_LINE = re.compile(r"^\d+\. ([^\s:]+)", re.M)
-# 算「在桌面上操作过」的 linux_desktop 动作；只读网页的 open、read、elements 不算
-GUI_ACTIONS = {"observe", "move", "click", "double_click", "drag", "mouse_down", "mouse_up", "scroll",
-               "keys", "key_down", "key_up", "type"}
+# 算「在桌面上操作过」、回复要附截图的 linux_desktop 动作：会改变画面的点击、输入、按键、拖拽。
+# 只是看的 observe、scroll、move 和读网页的 open、read、elements 不算，看公告给感想不必把截图发回聊天
+GUI_ACTIONS = {"click", "double_click", "drag", "mouse_down", "mouse_up", "keys", "key_down", "key_up", "type"}
 # 操作超时返回 running 时的说明；hook 看到它就直接载入 deferred 的 linux_poll（连同整组 linux 工具）
 RUNNING_MESSAGE = "操作仍在執行，用 linux_poll 繼續等待；沒有重複執行。"
 # 主程序 tool_search 结果里命中的每行「- 名称（本次新发现）」
@@ -128,6 +130,13 @@ def add_brief_reply_reminder(items: List[Dict[str, Any]]) -> Optional[List[Dict[
                    "和下一步操作放在同一輪發出，查完再正式回覆，中間不用回報進度。\n</system-reminder>"}],
     }
     return [*items[:end + 1], reminder, *items[end + 1:]]
+
+
+def computer_rules(subagent: bool, brief: bool, handoff: bool) -> str:
+    """开启的规则组合成系统提示词末尾的一段，内容只随设置变化；一条都没开时返回空字符串。"""
+    lines = [text for on, text in ((subagent, SUBAGENT_PREFERENCE), (brief, BRIEF_REPLY_FIRST),
+                                   (handoff, REPLY_HANDOFF)) if on]
+    return "\n\n使用 Linux 電腦的方式：\n" + "\n".join(f"- {line}" for line in lines) if lines else ""
 
 
 def append_to_system(items: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
@@ -216,9 +225,9 @@ def apply_tool_catalog(
 
 
 def add_screenshot_reminder(items: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-    """麦麦上次说话后在桌面上操作过（点击、输入、截图等）时，要求回复附上最新截图；否则返回 None。
+    """麦麦上次说话后在桌面上操作过（点击、输入、按键、拖拽，见 GUI_ACTIONS）时，要求回复附上最新截图；否则返回 None。
 
-    只用 open、read、elements 读网页不算操作，不必每次查资料都附图。操作之后有截图就给出 reply 的 attach_pic
+    只是看（observe、scroll）和读网页（open、read、elements）不算操作，不必每次看网页都附图。操作之后有截图就给出 reply 的 attach_pic
     要填的 media_index，还没有就要求先 observe 截一张。提醒插在最近一次 linux_desktop 那批工具结果（及其截图）之后。
     """
     spoke = max((index for index, item in enumerate(items) if _is_own_message(item)), default=-1)
@@ -416,11 +425,12 @@ class ComputerSectionConfig(PluginConfigBase):
         default=True, description="要求 Planner 用 reply 时把读到的内容写进 reply_reference（Replyer 看不到工具结果）；"
         "Replyer 模型有视觉时，把 Planner 上次说话后截的画面（最新 3 张）一起交给 Replyer")
     desktop_reply_screenshot: bool = Field(
-        default=True, description="上次说话后在桌面上操作过（点击、输入、截图等）时，要求麦麦回复时附上最新的截图")
+        default=True, description="上次说话后在桌面上操作过（点击、输入、按键、拖拽；只是截图、滚动看不算）时，要求麦麦回复时附上最新的截图")
     extract_task: str = Field(
         default="utils", description="linux_read_page 依 prompt 摘取网页重点用的模型任务（model_config 里的任务名），建议用快的小模型")
     prefer_subagent: bool = Field(
-        default=True, description="在 Planner 提示词里要求查资料时尽量交给子代理；主程序开启 planner_subagent 时才生效")
+        default=True, description="在 Planner 提示词里要求搜索、读好几个网页、比对信息时交给子代理，只看一个网页（查一件事、"
+        "给感想、看图）自己做；主程序开启 planner_subagent 时才生效")
     tool_catalog: bool = Field(
         default=True, description="接管 Planner 的 deferred tools：系统提示词只放类别目录，搜到的工具整组载入并在会话内保持，"
         "tools 顺序固定；对所有插件和内置工具生效")
@@ -512,7 +522,6 @@ class LinuxComputerPlugin(MaiBotPlugin):
         "要看幾個網址就一次全放進 urls 並行讀取，不要一輪讀一個。"
         "搜尋時讀 https://html.duckduckgo.com/html/?q=關鍵字（Google 會攔截自動存取），prompt 寫要找什麼，"
         "例如「列出 FFXIV 7.4 官方更新說明的連結」；摘要不夠再挑 2～3 個結果一次讀，資訊足夠回答就停。"
-        "需要搜尋加讀好幾頁的資料查詢，優先交給 subagent 並授權本工具，你繼續聊天。"
         "同一網址只能讀一次；要對網頁給感想或評論、看圖、更多內容、完整原文、點擊、登入，或讀取失敗、被阻擋時改用 linux_desktop。",
         parameters={"type": "object", "properties": {
             "urls": URLS_SCHEMA,
@@ -627,6 +636,12 @@ class LinuxComputerPlugin(MaiBotPlugin):
                                    reference)
         return None if items is None else {"action": "continue", "modified_kwargs": {"items": items}}
 
+    @HookHandler("maisaka.reply.before_post_process",
+                 description="一则回复生成完就清掉交给 Replyer 的截图，不会带到之后不经过 Planner 的回复")
+    async def handle_reply_done(self, **kwargs: Any) -> None:
+        """Replyer 重试时还要用同一批截图，所以等整则回复生成完（每则回复只触发一次）才清掉。"""
+        self._screens.pop(str(kwargs.get("session_id") or ""), None)
+
     @HookHandler("maisaka.planner.before_request",
                  description="提醒 Planner 打开聊天里的链接、用电脑前先简短回一句，可要求查资料交给子代理，接管 deferred tools")
     async def handle_planner_request(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
@@ -639,17 +654,18 @@ class LinuxComputerPlugin(MaiBotPlugin):
         definitions = kwargs.get("tool_definitions") or []
         tools = {tool_name(definition) for definition in definitions}
         items = add_link_reminder(original) or original
-        if "reply" in tools:
-            if self.config.computer.brief_reply_first:
-                items = append_to_system(items, BRIEF_REPLY_FIRST)
+        cfg, reply = self.config.computer, "reply" in tools
+        rules = computer_rules(cfg.prefer_subagent and "subagent" in tools, reply and cfg.brief_reply_first,
+                               reply and cfg.reply_handoff)
+        if rules:
+            items = append_to_system(items, rules)
+        if reply:
+            if cfg.brief_reply_first:
                 items = add_brief_reply_reminder(items) or items
-            if self.config.computer.reply_handoff:
-                items = append_to_system(items, REPLY_HANDOFF)
+            if cfg.reply_handoff:
                 self._screens[str(kwargs.get("session_id") or "")] = recent_tool_images(original)
-            if self.config.computer.desktop_reply_screenshot:
+            if cfg.desktop_reply_screenshot:
                 items = add_screenshot_reminder(items) or items
-        if self.config.computer.prefer_subagent and "subagent" in tools:
-            items = append_to_system(items, SUBAGENT_PREFERENCE)
         result = definitions
         if self.config.computer.tool_catalog and "tool_search" in tools:
             loaded, pool = self._tool_sessions.setdefault(str(kwargs.get("session_id") or ""), ({}, {}))
