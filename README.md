@@ -69,6 +69,17 @@
 
 工具说明、提醒和返回给模型的提示都用繁体中文；WebUI 配置说明和本文档仍是简体。
 
+## 给其他插件的 `lookup` API
+
+公开 API `luca.linux-computer.lookup`（`ctx.api.call` 或 `api.call` 能力），让其他插件不经过 Planner 直接用这台电脑上网查一段聊天在聊什么，
+例如 Discord 插件回复前的「联想」看不懂话题时调用：
+
+- 参数：`chat`（要查的那段聊天）、`hint`（调用方原本联想到的，可能不对，帮小模型写关键字）、`stream_id`（受 `allowed_chats` 限制）。
+- 流程：`extract_task` 的小模型写一组搜索关键字 → 读 DuckDuckGo HTML 版的结果页 → 读前 2 个外部结果（广告和 DuckDuckGo 自己的链接不算）
+  → 小模型整理成 300 字内的话题说明，只写资料里有根据的。共两次小模型调用，通常十几秒。
+- 返回 `{"success", "query", "summary", "sources"}`；失败时 `{"success": false, "error"}`，不抛异常。
+- 不经过 operation，调用方自己等结果（API 超时 150 秒）；也不计入 `linux_read_page` 的「同一网址只读一次」。
+
 ## 链接提醒
 
 插件挂在 `maisaka.planner.before_request`：最近 10 条聊天消息里有还没打开过的 http(s) 链接时，

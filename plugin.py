@@ -6,6 +6,7 @@
 
 from pathlib import Path
 from typing import Any, Awaitable, Dict, List, Optional
+from urllib.parse import quote, urlparse
 from uuid import uuid4
 
 import asyncio
@@ -13,7 +14,7 @@ import json
 import re
 import time
 
-from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk import API, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 
 IMAGE_DIR = Path(__file__).resolve().parent / "image"
 GUEST_PATH = "/opt/mai/guest.py"
@@ -390,6 +391,39 @@ EXTRACT_PROMPT = """你負責從網頁內容裡找出和問題相關的資訊，
 
 頁面連結：
 {links}"""
+# 公开给其他插件的 lookup API（例如 Discord 插件回复前的「联想」）：查一段聊天在聊什么。
+# 小模型写搜索关键字 → 读 DuckDuckGo 的 HTML 版 → 读前 LOOKUP_PAGES 个外部结果 → 小模型整理成话题说明
+SEARCH_URL = "https://html.duckduckgo.com/html/?q={query}"
+LOOKUP_PAGES = 2
+LOOKUP_SEARCH_TEXT = 4000  # 搜索结果页（标题和摘要）交给小模型的字数
+LOOKUP_PAGE_TEXT = 6000  # 每个结果页交给小模型的字数
+LOOKUP_TIMEOUT_MS = 150000
+LOOKUP_QUERY_PROMPT = """下面是 Discord 群聊裡的一段對話，你要上網查清楚他們在聊什麼。
+{chat}
+{hint}
+寫一組搜尋關鍵字（3～8 個詞，空格分開），要能查出對話裡提到的遊戲、作品、人物、新聞、梗或術語是什麼。
+只輸出關鍵字這一行，不要解釋。"""
+LOOKUP_SUMMARY_PROMPT = """下面是 Discord 群聊裡的一段對話，和用它上網搜尋到的資料。說明這段對話在聊什麼，讓沒看過的人也能接上話。
+對話：
+{chat}
+
+規則：
+- 用繁體中文，最多 300 字。
+- 第一句寫話題，例如「在聊《虹彩六號：圍攻》的對戰」；再逐項解釋對話裡的名詞、暱稱和梗是什麼意思。
+- 只寫資料裡找得到根據的；看不出來的寫「不確定」，不要編造。
+
+資料：
+{material}"""
+
+
+def search_results(links: List[Dict[str, Any]], limit: int) -> List[str]:
+    """搜索结果页的链接里挑前几个外部网址；DuckDuckGo 自己的页面和广告（跳转网址没有 uddg，仍是 duckduckgo.com）不算。"""
+    urls: List[str] = []
+    for link in links:
+        url = str(link.get("url") or "")
+        if url.startswith(("http://", "https://")) and not urlparse(url).netloc.endswith("duckduckgo.com") and url not in urls:
+            urls.append(url)
+    return urls[:limit]
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -622,6 +656,53 @@ class LinuxComputerPlugin(MaiBotPlugin):
         """取消操作。"""
         del kwargs
         return await self._safe(self._cancel(operation_id, stream_id))
+
+    # ===== 给其他插件的 API =====
+
+    @API("lookup", description="上網查一段聊天在聊什麼：寫搜尋關鍵字、讀搜尋結果和前幾個網頁，整理成話題說明",
+         version="1", public=True, timeout_ms=LOOKUP_TIMEOUT_MS)
+    async def lookup(self, chat: str = "", hint: str = "", stream_id: str = "", **kwargs: Any) -> Dict[str, Any]:
+        """返回 {"success", "query", "summary", "sources"}；失败时 {"success": False, "error"}，不抛异常。
+
+        chat 是要查的那段聊天；hint 是调用方原本联想到的（可能不对），帮小模型写关键字。
+        不经过 operation：调用方自己等结果，不需要 linux_poll。
+        """
+        del kwargs
+        if not chat.strip():
+            return {"success": False, "error": "需要 chat：要查的那段聊天"}
+        query = ""
+        try:
+            self._check_chat(stream_id)
+            hint_text = f"\n你原本聯想到的（可能不對）：\n{hint.strip()}\n" if hint.strip() else ""
+            lines = (await self._ask_model(LOOKUP_QUERY_PROMPT.format(chat=chat, hint=hint_text))).splitlines()
+            query = lines[0].strip().strip("「」\"'") if lines else ""
+            if not query:
+                return {"success": False, "error": "寫不出搜尋關鍵字"}
+            search = (await self._read_pages([SEARCH_URL.format(query=quote(query))], LOOKUP_SEARCH_TEXT))[0]
+            if "problem" in search:
+                return {"success": False, "query": query, "error": f"搜尋失敗：{search['problem']}"}
+            sources = search_results(search.get("links", []), LOOKUP_PAGES)
+            pages = await self._read_pages(sources, LOOKUP_PAGE_TEXT) if sources else []
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {"success": False, "query": query, "error": str(exc)}
+        read = [page for page in pages if "error" not in page and "problem" not in page]
+        material = "\n\n".join([f"搜尋結果（{query}）：\n{search['text']}",
+                                *(f"網頁 {page['url']}（{page['title']}）：\n{page['text']}" for page in read)])
+        summary = await self._ask_model(LOOKUP_SUMMARY_PROMPT.format(chat=chat, material=material))
+        if not summary:
+            return {"success": False, "query": query, "error": "整理不出結果"}
+        return {"success": True, "query": query, "summary": summary, "sources": [page["url"] for page in read]}
+
+    async def _read_pages(self, urls: List[str], text_limit: int) -> List[Dict[str, Any]]:
+        """直接读网页原文（不经过 operation、不摘取）；全部打不开时抛 RuntimeError。"""
+        await self._ensure()
+        cfg = self.config.computer
+        result = await self._guest("run", uuid4().hex, {
+            "actions": [{"action": "read", "urls": urls, "text_limit": text_limit, "link_limit": EXTRACT_LINKS}],
+            "screenshot": False, "max_edge": cfg.screenshot_max_edge, "max_tabs": cfg.max_tabs})
+        if not result.get("success"):
+            raise RuntimeError(result.get("error") or "讀取失敗")
+        return result["results"][0]["result"]["pages"]
 
     # ===== Hook =====
 

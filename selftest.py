@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import plugin as plugin_module  # noqa: E402
 from plugin import (BRIEF_REPLY_FIRST, RUNNING_MESSAGE, LinuxComputerPlugin, add_brief_reply_reminder,  # noqa: E402
                     add_link_reminder, add_screenshot_reminder, apply_tool_catalog, recent_tool_images)
 
@@ -380,6 +381,19 @@ async def main() -> None:
         result = json.loads(blocked["content"])["results"][0]["result"]
         assert [page.get("problem") for page in result["pages"]] == ["像是驗證或阻擋頁面", "HTTP 404", None], result
         assert "linux_desktop" in result["hint"], result
+        # lookup（给其他插件的 API）：小模型写关键字，读搜索结果页和前两个外部结果（广告、DuckDuckGo 自己的不算），
+        # 再整理成说明；搜索页换成本地页面
+        await plugin.handle_shell("echo '<a href=\"https://duckduckgo.com/y.js?ad\">ad</a>"
+                                  "<a href=\"http://127.0.0.1:8765/pic.html\">r1</a><a href=\"https://example.com/?lookup\">r2</a>"
+                                  "<a href=\"https://example.com/?third\">r3</a>' > /tmp/www/search.html", stream_id="owner")
+        plugin_module.SEARCH_URL = "http://127.0.0.1:8765/search.html?q={query}"
+        asked.clear()
+        found = await plugin.lookup(chat="「A」：羚羊拿MP5打盾牌", stream_id="owner")
+        assert found == {"success": True, "query": "摘要", "summary": "摘要",
+                         "sources": ["http://127.0.0.1:8765/pic.html", "https://example.com/?lookup"]}, found
+        # 本地页面没声明编码，中文会读成乱码，这里只看两个结果页都交给了整理的小模型
+        assert "羚羊拿MP5打盾牌" in asked[0] and "pic.html" in asked[1] and "domain" in asked[1], asked
+        assert not (await plugin.lookup(chat="x", stream_id="group"))["success"], "沒權限的聊天不能查"
         assert await tab_count() == tabs, "read tabs must be closed"
 
         # max_tabs=2：再开两个网页后，之前用 open 打开的 example.com 和本地页面两个分页被自动关闭
