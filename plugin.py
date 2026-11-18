@@ -401,15 +401,20 @@ LOOKUP_TIMEOUT_MS = 150000
 LOOKUP_QUERY_PROMPT = """下面是 Discord 群聊裡的一段對話，你要上網查清楚他們在聊什麼。
 {chat}
 {hint}
-寫一組搜尋關鍵字（3～8 個詞，空格分開），要能查出對話裡提到的遊戲、作品、人物、新聞、梗或術語是什麼。
-只輸出關鍵字這一行，不要解釋。"""
+{names}
+寫一組搜尋關鍵字（3～8 個詞，空格分開），要能查出對話內容裡提到的遊戲、作品、人物、新聞、梗或術語是什麼，不要放暱稱。
+對話太短或沒有要查的東西（只是附和、打招呼、一兩個字）就只輸出「無」。只輸出這一行，不要解釋。"""
+# 「」裡的发话人名字是用户自己取的 Discord 昵称，常像一句话或梗，小模型会把它当成要查、要解释的词
+LOOKUP_NAMES = "每行開頭「」裡是發話人的 Discord 暱稱，可以隨便改、常常像一句話或梗，不是話題；（你）和「@你」是發問的這個 AI 自己。"
+LOOKUP_NOTHING = "無"
 LOOKUP_SUMMARY_PROMPT = """下面是 Discord 群聊裡的一段對話，和用它上網搜尋到的資料。說明這段對話在聊什麼，讓沒看過的人也能接上話。
 對話：
 {chat}
+{names}
 
 規則：
 - 用繁體中文，最多 300 字。
-- 第一句寫話題，例如「在聊《虹彩六號：圍攻》的對戰」；再逐項解釋對話裡的名詞、暱稱和梗是什麼意思。
+- 第一句寫話題，例如「在聊《虹彩六號：圍攻》的對戰」；再逐項解釋對話內容裡的名詞和梗是什麼意思，不用解釋發話人的暱稱。
 - 只寫資料裡找得到根據的；看不出來的寫「不確定」，不要編造。
 
 資料：
@@ -674,10 +679,13 @@ class LinuxComputerPlugin(MaiBotPlugin):
         try:
             self._check_chat(stream_id)
             hint_text = f"\n你原本聯想到的（可能不對）：\n{hint.strip()}\n" if hint.strip() else ""
-            lines = (await self._ask_model(LOOKUP_QUERY_PROMPT.format(chat=chat, hint=hint_text))).splitlines()
+            prompt = LOOKUP_QUERY_PROMPT.format(chat=chat, hint=hint_text, names=LOOKUP_NAMES)
+            lines = (await self._ask_model(prompt)).splitlines()
             query = lines[0].strip().strip("「」\"'") if lines else ""
             if not query:
                 return {"success": False, "error": "寫不出搜尋關鍵字"}
+            if query == LOOKUP_NOTHING:
+                return {"success": False, "error": "這段對話沒有要查的東西"}
             search = (await self._read_pages([SEARCH_URL.format(query=quote(query))], LOOKUP_SEARCH_TEXT))[0]
             if "problem" in search:
                 return {"success": False, "query": query, "error": f"搜尋失敗：{search['problem']}"}
@@ -688,7 +696,7 @@ class LinuxComputerPlugin(MaiBotPlugin):
         read = [page for page in pages if "error" not in page and "problem" not in page]
         material = "\n\n".join([f"搜尋結果（{query}）：\n{search['text']}",
                                 *(f"網頁 {page['url']}（{page['title']}）：\n{page['text']}" for page in read)])
-        summary = await self._ask_model(LOOKUP_SUMMARY_PROMPT.format(chat=chat, material=material))
+        summary = await self._ask_model(LOOKUP_SUMMARY_PROMPT.format(chat=chat, names=LOOKUP_NAMES, material=material))
         if not summary:
             return {"success": False, "query": query, "error": "整理不出結果"}
         return {"success": True, "query": query, "summary": summary, "sources": [page["url"] for page in read]}

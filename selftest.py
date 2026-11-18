@@ -393,7 +393,19 @@ async def main() -> None:
                          "sources": ["http://127.0.0.1:8765/pic.html", "https://example.com/?lookup"]}, found
         # 本地页面没声明编码，中文会读成乱码，这里只看两个结果页都交给了整理的小模型
         assert "羚羊拿MP5打盾牌" in asked[0] and "pic.html" in asked[1] and "domain" in asked[1], asked
+        assert all(plugin_module.LOOKUP_NAMES in prompt for prompt in asked), "暱稱不是話題"
         assert not (await plugin.lookup(chat="x", stream_id="group"))["success"], "沒權限的聊天不能查"
+
+        # 小模型說沒有要查的（例如只有一句「打」）就不開搜尋
+        async def nothing_model(text: str) -> str:
+            asked.append(text)
+            return "無"
+
+        plugin._ask_model = nothing_model
+        asked.clear()
+        skipped = await plugin.lookup(chat="「Clover」：打", stream_id="owner")
+        assert skipped == {"success": False, "error": "這段對話沒有要查的東西"} and len(asked) == 1, (skipped, asked)
+        plugin._ask_model = fake_model
         assert await tab_count() == tabs, "read tabs must be closed"
 
         # max_tabs=2：再开两个网页后，之前用 open 打开的 example.com 和本地页面两个分页被自动关闭
