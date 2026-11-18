@@ -42,9 +42,9 @@ BRIEF_REPLY_FIRST = (
     "用 linux_read_page、linux_desktop 查東西要花一段時間：有人問了之後你還沒回過話，"
     "第一次呼叫時在同一輪也用 reply 簡短說一句你在看什麼（例如「我看一下」），查完再正式回覆，中間不用回報進度。"
 )
-# Replyer 只收到真实聊天消息和 reply_reference：工具的文字结果要 Planner 写进 reply_reference，
+# Replyer 只收到真实聊天消息和 chat_anlyze：工具的文字结果要 Planner 写进 chat_anlyze，
 # 截图由插件在 Replyer 请求前直接加进去（Replyer 模型有视觉时）
-REPLY_HANDOFF = ("用 reply 時把用電腦讀到的具體內容（名稱、日期、數字、重點）寫進 reply_reference，"
+REPLY_HANDOFF = ("用 reply 時把用電腦讀到的具體內容（名稱、日期、數字、重點）寫進 chat_anlyze，"
                  "Replyer 看不到工具的文字結果；你截過的畫面會一起交給 Replyer 看。")
 REPLYER_SCREENS = 3  # 交给 Replyer 的截图最多几张，取最新的
 REPLYER_SCREENS_NOTE = "以下是你剛才在 Linux 電腦上看到的畫面（越後面越新），回覆時可以依畫面內容說；這些是你自己截的圖，不是對方傳來的。"
@@ -302,7 +302,7 @@ def recent_tool_images(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def add_replyer_images(
     items: List[Dict[str, Any]], images: List[Dict[str, Any]], reference: str,
 ) -> Optional[List[Dict[str, Any]]]:
-    """把截图加进 Replyer 请求，放在 reply_reference 那条前面（找不到就放在最后一条 user 消息前面）；否则返回 None。"""
+    """把截图加进 Replyer 请求，放在 chat_anlyze 那条前面（找不到就放在最后一条 user 消息前面）；否则返回 None。"""
     users = [index for index, item in enumerate(items) if item.get("item_type") == "UserMessageItem"]
     if not images or not users:
         return None
@@ -461,7 +461,7 @@ class ComputerSectionConfig(PluginConfigBase):
         default=True, description="有人说话后麦麦要用电脑（读网页、操作桌面）时，要求先简短回一句（例如「我看一下」），"
         "查完再正式回复；中途不定时回报进度")
     reply_handoff: bool = Field(
-        default=True, description="要求 Planner 用 reply 时把读到的内容写进 reply_reference（Replyer 看不到工具结果）；"
+        default=True, description="要求 Planner 用 reply 时把读到的内容写进 chat_anlyze（Replyer 看不到工具结果）；"
         "Replyer 模型有视觉时，把 Planner 上次说话后截的画面（最新 3 张）一起交给 Replyer")
     desktop_reply_screenshot: bool = Field(
         default=True, description="上次说话后在桌面上操作过（点击、输入、按键、拖拽；只是截图、滚动看不算）时，要求麦麦回复时附上最新的截图")
@@ -720,7 +720,7 @@ class LinuxComputerPlugin(MaiBotPlugin):
         """Replyer 只收到真实聊天消息，看不到工具返回的截图；这里补上 Planner 回复前看过的最新几张。"""
         if not self.config.computer.reply_handoff or not kwargs.get("selected_model_visual"):
             return None
-        reference = str((kwargs.get("reply_tool_args") or {}).get("reply_reference") or "")
+        reference = str((kwargs.get("reply_tool_args") or {}).get("chat_anlyze") or "")
         items = add_replyer_images(kwargs.get("items") or [], self._screens.get(str(kwargs.get("session_id") or ""), []),
                                    reference)
         return None if items is None else {"action": "continue", "modified_kwargs": {"items": items}}

@@ -84,7 +84,7 @@ def check_brief_reply_reminder() -> None:
 
 
 async def check_replyer_images() -> None:
-    """Replyer 截图：Planner 上次说话后工具返回的图片（最新 3 张）放在 reply_reference 前面；模型没视觉就不加。"""
+    """Replyer 截图：Planner 上次说话后工具返回的图片（最新 3 张）放在 chat_anlyze 前面；模型没视觉就不加。"""
 
     def item(item_id: str, *parts: dict) -> dict:
         return {"item_type": "UserMessageItem", "meta": {"item_id": item_id, "logical_turn_id": None,
@@ -112,7 +112,7 @@ async def check_replyer_images() -> None:
     plugin.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"}, "computer": {}})
     tools = [{"type": "function", "function": {"name": "reply"}}]
     await plugin.handle_planner_request(items=[system, *planner], tool_definitions=tools, session_id="s")
-    args = {"items": replyer, "session_id": "s", "reply_tool_args": {"reply_reference": "公告重點：11 月 19 日主線第六章"}}
+    args = {"items": replyer, "session_id": "s", "reply_tool_args": {"chat_anlyze": "公告重點：11 月 19 日主線第六章"}}
     hooked = await plugin.handle_replyer_request(**args, selected_model_visual=True)
     items = hooked["modified_kwargs"]["items"]
     assert [i["meta"]["item_id"] for i in items] == ["sys", "chat", "replyer-screens-ref", "ref", "final"], items
