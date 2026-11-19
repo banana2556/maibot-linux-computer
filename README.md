@@ -62,9 +62,7 @@
 为了少跑轮数，工具说明要求：几个网址一次放进 `urls` 并行读；通常挑 2～3 个最相关的结果，信息够了就停。
 
 每条规则只写在一个地方：工具说明只写工具之间怎么选（查事实用 `linux_read_page`，给感想、看图、操作用 `linux_desktop`）；
-自己做还是交给子代理、先回一句、交给 Replyer 这三条，按设置组合成系统提示词末尾的一段「使用 Linux 電腦的方式」，每轮内容相同。
-分流规则是：搜索、读好几个网页、比对信息交给后台子代理（需开启 `planner_subagent` 和 `advanced_sub_agent`）；
-只看一个网页（查一件事、给感想、看图）自己做，因为子代理截的图只留在子代理自己的历史里，传不到回复里。
+系统提示词不另外加使用规则：交给子代理、把查到的内容写进 `chat_anlyze`，主程序的提示词和 reply 工具说明已经写了；有人在等时先回一句，只在她漏了时当下提醒。
 `linux_desktop` 的 `read` 返回的原文合计约 1.2 万字、链接 40 个，因为会整段留在 Planner 上下文里，更长的页面会截断。
 
 工具说明、提醒和返回给模型的提示都用繁体中文；WebUI 配置说明和本文档仍是简体。
@@ -154,11 +152,10 @@ advanced_sub_agent = true
 | `computer.networking` / `memory_mb` / `screen` / `vnc_port` | 创建容器时生效；改完需删除容器重建 |
 | `computer.screenshot_max_edge` | 截图最长边，越小越省 token |
 | `computer.max_tabs` | 麦麦打开的网页标签页上限，默认 5，0 为不限制 |
-| `computer.brief_reply_first` | 有人说话后要用电脑时，要求先简短回一句再查，查完再正式回复；默认开启 |
-| `computer.reply_handoff` | 要求 Planner 把读到的内容写进 `reply_reference`；Replyer 有视觉时把最新 3 张截图一起交给它；默认开启 |
+| `computer.brief_reply_first` | 有人说话后她还没回应就开始用电脑时，提醒先简短回一句再查，查完再正式回复；默认开启 |
+| `computer.reply_handoff` | Replyer 有视觉时把 Planner 上次说话后截的最新 3 张图一起交给它；默认开启 |
 | `computer.desktop_reply_screenshot` | 上次说话后在桌面上操作过时，要求回复附上最新截图，默认开启 |
 | `computer.extract_task` | `linux_read_page` 按 `prompt` 摘取网页用的模型任务（`model_config` 里的任务名），默认 `utils`，建议用快的小模型 |
-| `computer.prefer_subagent` | 在 Planner 系统提示词末尾要求搜索、读好几个网页、比对信息时交给子代理，派出后等它回报、不自己重做；只看一个网页（查一件事、给感想、看图）自己做，因为子代理截的图传不到回复里；默认开启，主程序没开 `planner_subagent` 时不生效 |
 | `computer.tool_catalog` | 接管 Planner 的 deferred tools（类别目录、整组载入、会话内保持、顺序固定），默认开启；关闭后交回主程序原本的 `tool_search` |
 
 ## 看它在做什么 / 手动接管

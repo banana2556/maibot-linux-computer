@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import plugin as plugin_module  # noqa: E402
-from plugin import (BRIEF_REPLY_FIRST, RUNNING_MESSAGE, LinuxComputerPlugin, add_brief_reply_reminder,  # noqa: E402
+from plugin import (RUNNING_MESSAGE, LinuxComputerPlugin, add_brief_reply_reminder,  # noqa: E402
                     add_link_reminder, add_screenshot_reminder, apply_tool_catalog, recent_tool_images)
 
 NAME = "maibot-linux-computer-selftest"
@@ -238,8 +238,8 @@ async def check_tool_catalog() -> None:
         tool_definitions=[tool("reply"), tool("tool_search"), tool("linux_read_page"), tool("linux_desktop")])
     assert names(hooked["modified_kwargs"]["tool_definitions"]) == [
         "reply", "tool_search", "linux_read_page", "linux_desktop", "linux_shell", "linux_poll", "linux_cancel"], hooked
-    # 有 reply 的 Planner 请求：系统提示词末尾要求第一次用电脑时同一轮先简短回一句
-    assert BRIEF_REPLY_FIRST in hooked["modified_kwargs"]["items"][0]["parts"][-1]["text"], hooked
+    # 系统提示词不再加「使用 Linux 電腦的方式」
+    assert "使用 Linux" not in json.dumps(hooked["modified_kwargs"]["items"], ensure_ascii=False), hooked
 
 
 async def main() -> None:
@@ -251,17 +251,11 @@ async def main() -> None:
     plugin = LinuxComputerPlugin()
     plugin.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
                               "computer": {"container_name": NAME, "vnc_port": 0, "allowed_chats": ["owner"], "max_tabs": 2}})
-    # 子代理要求只加在有 subagent 工具的 Planner 请求上；子代理自己的请求没有 reply / subagent
+    # 系统提示词不加使用规则：没有连结、截图、要提醒的事时，Planner 请求原样放行
     system = [{"item_type": "SystemMessageItem", "meta": {"item_id": "s", "logical_turn_id": None,
                "timestamp": "2026-11-02T12:00:00"}, "parts": [{"type": "text", "text": "system"}]}]
     tools = [{"type": "function", "function": {"name": name}} for name in ("reply", "subagent")]
-    hooked = await plugin.handle_planner_request(items=system, tool_definitions=tools)
-    # 三条规则组合成系统提示词末尾的一段，分流只写在这里
-    rules = hooked["modified_kwargs"]["items"][0]["parts"][0]["text"]
-    assert rules.count("使用 Linux 電腦的方式") == 1 and rules.count("\n- ") == 3 and "subagent" in rules, rules
-    only_reply = await plugin.handle_planner_request(items=system, tool_definitions=tools[:1])
-    prompt = only_reply["modified_kwargs"]["items"][0]["parts"][0]["text"]
-    assert BRIEF_REPLY_FIRST in prompt and "subagent" not in prompt, prompt
+    assert await plugin.handle_planner_request(items=system, tool_definitions=tools) is None
     reader = [{"type": "function", "function": {"name": "linux_read_page"}}]  # 子代理自己的请求：不动
     assert await plugin.handle_planner_request(items=system, tool_definitions=reader) is None
     try:

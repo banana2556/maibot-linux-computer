@@ -30,22 +30,8 @@ CHAT_HEADER = re.compile(r'<message (?![^>]*is_self_message="true")[^>]*\buser="
 SELF_HEADER = re.compile(r'<message [^>]*is_self_message="true"')
 # 只提醒最近这么多条聊天消息里的链接，更早的视为已经过去的话题
 RECENT_IM_MESSAGES = 10
-# Planner 系统提示词末尾的「使用 Linux 电脑的方式」：下面三条按设置组合成一段固定内容，见 computer_rules。
-# 每条规则只写在一个地方：自己做还是交给子代理只写在这里，工具说明只写工具之间怎么选。
-# 分流：子代理截的图只留在子代理自己的历史里，Replyer 看不到，所以给感想、看图要自己做
-SUBAGENT_PREFERENCE = (
-    "要搜尋、讀好幾個網頁或比對資訊時，交給 subagent 並授權它需要的工具，派出後等它回報，不要自己再查同一件事；"
-    "只看一個網頁（查一件事、給感想、看圖）自己做，subagent 截的圖傳不到你的回覆裡。"
-)
-# 第一次用电脑时就在同一轮简短回一句；漏了由 add_brief_reply_reminder 补提醒
-BRIEF_REPLY_FIRST = (
-    "用 linux_read_page、linux_desktop 查東西要花一段時間：有人問了之後你還沒回過話，"
-    "第一次呼叫時在同一輪也用 reply 簡短說一句你在看什麼（例如「我看一下」），查完再正式回覆，中間不用回報進度。"
-)
-# Replyer 只收到真实聊天消息和 chat_anlyze：工具的文字结果要 Planner 写进 chat_anlyze，
-# 截图由插件在 Replyer 请求前直接加进去（Replyer 模型有视觉时）
-REPLY_HANDOFF = ("用 reply 時把用電腦讀到的具體內容（名稱、日期、數字、重點）寫進 chat_anlyze，"
-                 "Replyer 看不到工具的文字結果；你截過的畫面會一起交給 Replyer 看。")
+# Planner 不另外加使用规则：交给子代理、把查到的内容写进 chat_anlyze，主程序的提示词和 reply 工具说明已经写了；
+# 有人在等时先回一句，漏了才由 add_brief_reply_reminder 在当下提醒
 REPLYER_SCREENS = 3  # 交给 Replyer 的截图最多几张，取最新的
 REPLYER_SCREENS_NOTE = "以下是你剛才在 Linux 電腦上看到的畫面（越後面越新），回覆時可以依畫面內容說；這些是你自己截的圖，不是對方傳來的。"
 # 主程序 deferred tools 提示（runtime.build_deferred_tools_reminder）的开头和每行「N. 名称: 描述」
@@ -131,13 +117,6 @@ def add_brief_reply_reminder(items: List[Dict[str, Any]]) -> Optional[List[Dict[
                    "和下一步操作放在同一輪發出，查完再正式回覆，中間不用回報進度。\n</system-reminder>"}],
     }
     return [*items[:end + 1], reminder, *items[end + 1:]]
-
-
-def computer_rules(subagent: bool, brief: bool, handoff: bool) -> str:
-    """开启的规则组合成系统提示词末尾的一段，内容只随设置变化；一条都没开时返回空字符串。"""
-    lines = [text for on, text in ((subagent, SUBAGENT_PREFERENCE), (brief, BRIEF_REPLY_FIRST),
-                                   (handoff, REPLY_HANDOFF)) if on]
-    return "\n\n使用 Linux 電腦的方式：\n" + "\n".join(f"- {line}" for line in lines) if lines else ""
 
 
 def append_to_system(items: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
@@ -458,18 +437,14 @@ class ComputerSectionConfig(PluginConfigBase):
     screenshot_max_edge: int = Field(default=1280, description="截图最长边（像素），0 为原始分辨率；坐标始终按返回的截图计算")
     max_tabs: int = Field(default=5, description="麦麦用 open 打开的网页标签页最多保留几个，超出时自动关闭最早的；0 为不限制")
     brief_reply_first: bool = Field(
-        default=True, description="有人说话后麦麦要用电脑（读网页、操作桌面）时，要求先简短回一句（例如「我看一下」），"
-        "查完再正式回复；中途不定时回报进度")
+        default=True, description="有人说话后麦麦还没回应就开始用电脑（读网页、操作桌面）时，提醒她先简短回一句"
+        "（例如「我看一下」），查完再正式回复；中途不定时回报进度")
     reply_handoff: bool = Field(
-        default=True, description="要求 Planner 用 reply 时把读到的内容写进 chat_anlyze（Replyer 看不到工具结果）；"
-        "Replyer 模型有视觉时，把 Planner 上次说话后截的画面（最新 3 张）一起交给 Replyer")
+        default=True, description="Replyer 模型有视觉时，把 Planner 上次说话后截的画面（最新 3 张）一起交给 Replyer")
     desktop_reply_screenshot: bool = Field(
         default=True, description="上次说话后在桌面上操作过（点击、输入、按键、拖拽；只是截图、滚动看不算）时，要求麦麦回复时附上最新的截图")
     extract_task: str = Field(
         default="utils", description="linux_read_page 依 prompt 摘取网页重点用的模型任务（model_config 里的任务名），建议用快的小模型")
-    prefer_subagent: bool = Field(
-        default=True, description="在 Planner 提示词里要求搜索、读好几个网页、比对信息时交给子代理，只看一个网页（查一件事、"
-        "给感想、看图）自己做；主程序开启 planner_subagent 时才生效")
     tool_catalog: bool = Field(
         default=True, description="接管 Planner 的 deferred tools：系统提示词只放类别目录，搜到的工具整组载入并在会话内保持，"
         "tools 顺序固定；对所有插件和内置工具生效")
@@ -744,10 +719,6 @@ class LinuxComputerPlugin(MaiBotPlugin):
         tools = {tool_name(definition) for definition in definitions}
         items = add_link_reminder(original) or original
         cfg, reply = self.config.computer, "reply" in tools
-        rules = computer_rules(cfg.prefer_subagent and "subagent" in tools, reply and cfg.brief_reply_first,
-                               reply and cfg.reply_handoff)
-        if rules:
-            items = append_to_system(items, rules)
         if reply:
             if cfg.brief_reply_first:
                 items = add_brief_reply_reminder(items) or items
